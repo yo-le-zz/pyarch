@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import marshal
 import shutil
 import sys
 from pathlib import Path
+
+from .pyz import PYZError, parse_pyz
 
 
 RUNTIME_NAMES = (
@@ -27,13 +31,28 @@ def _is_runtime_name(name: str) -> bool:
 def _safe_relative_path(name: str) -> Path:
     """Convert an archive name to a safe relative filesystem path."""
 
-    normalized = name.replace("\\", "/")
+    normalized = name.replace(
+        "\\",
+        "/",
+    )
+
+    relative = Path(normalized)
+
+    if relative.is_absolute():
+        raise ValueError(
+            f"Unsafe archive path: {name!r}"
+        )
 
     parts = [
         part
-        for part in normalized.split("/")
-        if part not in {"", ".", ".."}
+        for part in relative.parts
+        if part not in {"", "."}
     ]
+
+    if ".." in parts:
+        raise ValueError(
+            f"Unsafe archive path: {name!r}"
+        )
 
     if not parts:
         raise ValueError(
@@ -62,27 +81,127 @@ def _copy_file(
     return target
 
 
+def _get_python_magic(
+    root: Path,
+) -> bytes:
+    """
+    Determine the Python magic number used by the bundle.
+
+    The PYZ header is the best source because it contains the exact
+    magic used to marshal the bytecode contained in the archive.
+
+    importlib.util.MAGIC_NUMBER is used as a fallback.
+    """
+
+    raw_root = (
+        root
+        / "archive"
+        / "raw"
+    )
+
+    candidates = [
+        raw_root / "PYZ.pyz",
+        *raw_root.glob("*.pyz"),
+        *raw_root.glob("*PYZ*.pyz"),
+    ]
+
+    seen: set[Path] = set()
+
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            continue
+
+        if candidate in seen:
+            continue
+
+        seen.add(candidate)
+
+        if not candidate.is_file():
+            continue
+
+        try:
+            archive = parse_pyz(candidate)
+
+            magic = archive.python_magic
+
+            if len(magic) == 4:
+                return magic
+
+        except (
+            PYZError,
+            OSError,
+        ):
+            continue
+
+    return importlib.util.MAGIC_NUMBER
+
+
+def _make_pyc(
+    magic: bytes,
+    payload: bytes,
+) -> bytes:
+    """
+    Build a valid Python 3.7+ .pyc file.
+
+    PyInstaller CArchive ``s`` entries contain the marshalled
+    code object without the normal .pyc header.
+
+    Header layout:
+
+        4 bytes  magic
+        4 bytes  flags
+        8 bytes  timestamp/hash data
+    """
+
+    if len(magic) != 4:
+        raise ValueError(
+            "Python magic must contain exactly 4 bytes."
+        )
+
+    # Validate the payload before writing it.
+    try:
+        code = marshal.loads(payload)
+    except Exception as error:
+        raise ValueError(
+            "Source payload does not contain a valid "
+            "marshalled Python object."
+        ) from error
+
+    # The source entry should contain a code object.
+    if not hasattr(code, "co_code"):
+        raise ValueError(
+            "Source payload does not contain a Python code object."
+        )
+
+    return (
+        magic
+        + b"\x00\x00\x00\x00"
+        + b"\x00" * 8
+        + payload
+    )
+
+
 def _copy_source(
     source: Path,
     output: Path,
     name: str,
+    magic: bytes,
 ) -> Path:
     """
-    Copy a PyInstaller script payload into source/.
+    Convert a PyInstaller ``s`` payload into a real .pyc file.
 
-    PyInstaller CArchive entries of type ``s`` contain the
-    marshalled Python bytecode directly and normally have no
-    .pyc extension. PyArch exposes them as .pyc files so that
-    the rest of the pipeline can process them normally.
+    The raw CArchive payload is never modified.
     """
 
-    relative = _safe_relative_path(name)
+    relative = _safe_relative_path(
+        name
+    )
 
     if relative.suffix != ".pyc":
         relative = relative.with_suffix(
-            relative.suffix + ".pyc"
-            if relative.suffix
-            else ".pyc"
+            ".pyc"
         )
 
     target = (
@@ -91,10 +210,23 @@ def _copy_source(
         / relative
     )
 
-    return _copy_file(
-        source,
-        target,
+    payload = source.read_bytes()
+
+    pyc = _make_pyc(
+        magic,
+        payload,
     )
+
+    target.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    target.write_bytes(
+        pyc
+    )
+
+    return target
 
 
 def _copy_category(
@@ -105,7 +237,9 @@ def _copy_category(
 ) -> Path:
     """Copy an extracted archive entry into a category directory."""
 
-    relative = _safe_relative_path(name)
+    relative = _safe_relative_path(
+        name
+    )
 
     target = (
         output
@@ -127,15 +261,12 @@ def _classify_carchive_entry(
 
     lower = name.lower()
 
-    # PYZ archives.
     if lower.endswith(".pyz"):
         return "pyz"
 
-    # Python's bundled standard library archive.
     if lower.endswith(".zip"):
-        return "stdlib"
+        return "runtime"
 
-    # Native libraries.
     if lower.endswith(
         (
             ".so",
@@ -147,24 +278,19 @@ def _classify_carchive_entry(
     ):
         return "libraries"
 
-    # PyInstaller bootloader/runtime modules.
     if _is_runtime_name(name):
         return "runtime"
 
-    # PyInstaller binary/data entries.
     if typecode in {
         "b",
         "d",
     }:
         return "libraries"
 
-    # ``s`` means a Python script/source payload.
-    #
-    # This is where the application's main.pyc normally lives.
+    # ``s`` is a Python script payload.
     if typecode == "s":
         return "source"
 
-    # Generic binary/data.
     return "data"
 
 
@@ -174,20 +300,26 @@ def _classify_pyz_module(
     """
     Classify a PYZ module as stdlib or application.
 
-    PyInstaller does not provide enough information in the PYZ
-    TOC to perfectly distinguish third-party packages from
-    application code. The top-level module name is therefore
-    compared against Python's standard-library module list.
-
-    Non-stdlib modules are considered application-side for now.
+    Python's stdlib module list is used for the first-level
+    classification. Third-party dependencies are therefore grouped
+    with application-side modules for now.
     """
 
-    normalized = name.replace("\\", "/")
+    normalized = name.replace(
+        "\\",
+        "/",
+    )
 
     if "/" in normalized:
-        top_level = normalized.split("/", 1)[0]
+        top_level = normalized.split(
+            "/",
+            1,
+        )[0]
     else:
-        top_level = normalized.split(".", 1)[0]
+        top_level = normalized.split(
+            ".",
+            1,
+        )[0]
 
     stdlib = getattr(
         sys,
@@ -227,7 +359,15 @@ def _load_carchive_toc(
     if not toc_path.is_file():
         return []
 
-    data = _load_json(toc_path)
+    try:
+        data = _load_json(
+            toc_path
+        )
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return []
 
     if not isinstance(data, list):
         return []
@@ -253,7 +393,15 @@ def _load_pyz_toc(
     if not toc_path.is_file():
         return []
 
-    data = _load_json(toc_path)
+    try:
+        data = _load_json(
+            toc_path
+        )
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return []
 
     if not isinstance(data, list):
         return []
@@ -270,7 +418,7 @@ def _classify_carchive(
     output: Path,
     counters: dict[str, int],
 ) -> None:
-    """Classify files extracted from the PyInstaller CArchive."""
+    """Classify files extracted from the CArchive."""
 
     raw_root = (
         root
@@ -281,7 +429,13 @@ def _classify_carchive(
     if not raw_root.is_dir():
         return
 
-    for entry in _load_carchive_toc(root):
+    magic = _get_python_magic(
+        root
+    )
+
+    for entry in _load_carchive_toc(
+        root
+    ):
         name = entry.get("name")
         typecode = entry.get("type")
 
@@ -291,9 +445,16 @@ def _classify_carchive(
         if not isinstance(typecode, str):
             continue
 
+        try:
+            relative = _safe_relative_path(
+                name
+            )
+        except ValueError:
+            continue
+
         source = (
             raw_root
-            / _safe_relative_path(name)
+            / relative
         )
 
         if not source.is_file():
@@ -304,28 +465,30 @@ def _classify_carchive(
             typecode,
         )
 
-        # PYZ is handled separately by the PYZ classifier.
-        if category == "pyz":
-            target = (
-                output
-                / "pyz"
-                / source.name
-            )
-
-            _copy_file(
-                source,
-                target,
-            )
-
-            counters["pyz"] += 1
-            continue
-
         if category == "source":
-            _copy_source(
+            try:
+                _copy_source(
+                    source,
+                    output,
+                    name,
+                    magic,
+                )
+            except (
+                OSError,
+                ValueError,
+            ):
+                # Keep the raw entry available even if reconstruction
+                # of this particular source payload fails.
+                continue
+
+        elif category == "pyz":
+            _copy_category(
                 source,
                 output,
+                "pyz",
                 name,
             )
+
         else:
             _copy_category(
                 source,
@@ -335,6 +498,29 @@ def _classify_carchive(
             )
 
         counters[category] += 1
+
+
+def _build_module_map(
+    pyc_root: Path,
+) -> dict[str, Path]:
+    """Build a mapping from PYZ module names to extracted .pyc files."""
+
+    module_paths: dict[str, Path] = {}
+
+    for path in sorted(
+        pyc_root.rglob("*.pyc")
+    ):
+        relative = path.relative_to(
+            pyc_root
+        )
+
+        module_name = ".".join(
+            relative.with_suffix("").parts
+        )
+
+        module_paths[module_name] = path
+
+    return module_paths
 
 
 def _classify_pyz(
@@ -352,29 +538,16 @@ def _classify_pyz(
     if not pyc_root.is_dir():
         return
 
-    toc = _load_pyz_toc(root)
+    module_paths = _build_module_map(
+        pyc_root
+    )
 
-    # Build a mapping from module name to its extracted .pyc file.
-    module_paths: dict[str, Path] = {}
+    toc = _load_pyz_toc(
+        root
+    )
 
-    for path in sorted(
-        pyc_root.rglob("*.pyc")
-    ):
-        relative = path.relative_to(
-            pyc_root
-        )
+    processed: set[Path] = set()
 
-        # Convert:
-        #     package/module.pyc
-        # into:
-        #     package.module
-        module_name = ".".join(
-            relative.with_suffix("").parts
-        )
-
-        module_paths[module_name] = path
-
-    # Prefer the actual PYZ TOC when available.
     if toc:
         for entry in toc:
             name = entry.get("name")
@@ -382,22 +555,27 @@ def _classify_pyz(
             if not isinstance(name, str):
                 continue
 
-            source = module_paths.get(name)
+            normalized = (
+                name.replace("/", ".")
+                .replace("\\", ".")
+            )
+
+            source = module_paths.get(
+                name
+            )
 
             if source is None:
-                # Some PYZ names can use slightly different
-                # representations. Try the normalized path.
-                normalized = (
-                    name.replace("/", ".")
-                    .replace("\\", ".")
-                )
-
                 source = module_paths.get(
                     normalized
                 )
 
             if source is None:
                 continue
+
+            if source in processed:
+                continue
+
+            processed.add(source)
 
             category = _classify_pyz_module(
                 name
@@ -420,12 +598,13 @@ def _classify_pyz(
 
             counters[category] += 1
 
-        return
-
-    # Fallback when pyz/toc.json is unavailable.
+    # Process any extracted .pyc that wasn't represented by the TOC.
     for source in sorted(
         pyc_root.rglob("*.pyc")
     ):
+        if source in processed:
+            continue
+
         relative = source.relative_to(
             pyc_root
         )
@@ -504,8 +683,8 @@ def classify_extraction(
     """
     Classify an extracted PyInstaller project.
 
-    The original archive/raw and pyc directories are preserved.
-    Classified copies are created under:
+    Raw archive files and the original PYZ-extracted bytecode are
+    preserved. Classified copies are placed under:
 
         source/
         application/
@@ -531,7 +710,7 @@ def classify_extraction(
     if not root.is_dir():
         return counters
 
-    # Remove previous classification output.
+    # Remove the previous classification.
     for directory in (
         "source",
         "application",
@@ -544,7 +723,9 @@ def classify_extraction(
         path = root / directory
 
         if path.exists():
-            shutil.rmtree(path)
+            shutil.rmtree(
+                path
+            )
 
     _classify_carchive(
         root,
