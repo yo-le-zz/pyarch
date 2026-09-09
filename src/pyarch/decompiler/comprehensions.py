@@ -128,6 +128,10 @@ class ComprehensionStructure:
     multiple_for: bool = False
     is_async: bool = False
 
+    # True when the comprehension is compiled directly into the
+    # surrounding code object, as can happen on Python 3.13+.
+    inline: bool = False
+
     append_opcode: str | None = None
 
     instruction_count: int = 0
@@ -592,22 +596,26 @@ def analyze_comprehension_structure(
         )
 
         return ComprehensionStructure(
-            kind=comprehension_type(code),
-            has_for=has_for_iteration(code),
-            has_if=has_filters(code),
-            multiple_for=has_multiple_iterations(code),
+            kind=kind,
+            has_for=True,
+            has_if=_contains_any(
+                names,
+                _FILTER_JUMPS,
+            ),
+            multiple_for=for_count > 1,
             is_async=_contains_any(
                 names,
                 {"GET_AITER", "GET_ANEXT"},
             ),
-            append_opcode=_detect_append_opcode(
-                names
-            ),
-            instruction_count=len(
-                names
-            ),
-            names=comprehension_element_names(
-                code
+            inline=True,
+            append_opcode=append_opcode,
+            instruction_count=len(instructions),
+            names=sorted(
+                {
+                    name
+                    for name in code.co_names
+                    if isinstance(name, str)
+                }
             ),
         )
 
