@@ -3,10 +3,11 @@ from __future__ import annotations
 """
 Class reconstruction for PyArch.
 
-This module extracts class-related information from Python code
-objects and prepares it for the common PyArch IR.
+This module detects and describes Python class code objects.
 
-The bytecode -> AST conversion is intentionally left to the later
+Class construction is deliberately conservative. The surrounding
+bytecode is required to recover bases, decorators and metaclass
+arguments reliably; those details will be handled by the main
 decompiler engine.
 """
 
@@ -18,7 +19,6 @@ from .ir import (
     Function,
     IRExpression,
     IRStatement,
-    Name,
 )
 
 
@@ -32,49 +32,24 @@ class ClassError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Class metadata
+# Metadata
 # ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
 class ClassMetadata:
-    """Metadata recovered for a Python class."""
+    """Metadata recovered from a Python class body."""
 
     name: str
-
     bases: list[IRExpression]
-
-    keywords: list[tuple[str, IRExpression]]
-
     decorators: list[IRExpression]
-
     methods: list[Function]
-
     body: list[IRStatement]
 
 
 # ---------------------------------------------------------------------------
-# Code object classification
+# Code object helpers
 # ---------------------------------------------------------------------------
-
-
-def is_class_body(
-    code: CodeType,
-) -> bool:
-    """
-    Return whether a code object looks like a class body.
-
-    Python class bodies are compiled as separate code objects whose
-    name normally corresponds to the class name.
-
-    This function is intentionally conservative because bytecode alone
-    does not always preserve the complete source-level context.
-    """
-
-    if code.co_name == "<module>":
-        return False
-
-    return True
 
 
 def nested_code_objects(
@@ -85,68 +60,93 @@ def nested_code_objects(
     result: list[CodeType] = []
 
     for constant in code.co_consts:
-        if isinstance(
-            constant,
-            CodeType,
-        ):
+        if isinstance(constant, CodeType):
             result.append(constant)
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Function classification
-# ---------------------------------------------------------------------------
-
-
-def _looks_like_function(
+def is_class_code(
     code: CodeType,
 ) -> bool:
     """
-    Determine whether a nested code object likely represents a method
-    or normal function.
+    Return whether a code object could represent a class body.
 
-    Compiler-generated comprehensions and lambdas are excluded here;
-    they are handled by other reconstruction passes.
+    This is only a heuristic. A CodeType does not contain an explicit
+    "this is a class" flag.
     """
 
-    if code.co_name in {
-        "<listcomp>",
-        "<setcomp>",
-        "<dictcomp>",
-        "<genexpr>",
-        "<lambda>",
-    }:
+    if code.co_name == "<module>":
         return False
 
-    return code.co_name != "<module>"
+    if code.co_name.startswith("<"):
+        return False
+
+    # Class bodies normally do not receive normal Python arguments.
+    if code.co_argcount != 0:
+        return False
+
+    if code.co_kwonlyargcount != 0:
+        return False
+
+    if code.co_posonlyargcount != 0:
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Method detection
+# ---------------------------------------------------------------------------
+
+
+_GENERATED_CODE_NAMES = {
+    "<lambda>",
+    "<listcomp>",
+    "<setcomp>",
+    "<dictcomp>",
+    "<genexpr>",
+    "<async_generator>",
+}
+
+
+def is_method_code(
+    code: CodeType,
+) -> bool:
+    """
+    Return whether a nested code object looks like a method.
+
+    Compiler-generated helper code is excluded.
+    """
+
+    if code.co_name in _GENERATED_CODE_NAMES:
+        return False
+
+    if code.co_name == "<module>":
+        return False
+
+    return True
 
 
 def discover_methods(
     code: CodeType,
 ) -> list[Function]:
     """
-    Discover method-like nested code objects.
+    Discover method code objects directly contained in a class body.
 
-    Function bodies are populated later by the main decompiler engine.
+    Function bodies are reconstructed later by the main engine.
     """
 
     from .functions import build_function
 
     methods: list[Function] = []
 
-    for nested in nested_code_objects(
-        code
-    ):
-        if not _looks_like_function(
-            nested
-        ):
+    for nested in nested_code_objects(code):
+        if not is_method_code(nested):
             continue
 
         methods.append(
-            build_function(
-                nested
-            )
+            build_function(nested)
         )
 
     return methods
@@ -197,6 +197,33 @@ def is_special_method(
     return function.name in _SPECIAL_METHODS
 
 
+def find_method(
+    class_ir: Class,
+    name: str,
+) -> Function | None:
+    """
+    Find a method in a class.
+
+    The current IR stores methods separately only in later engine
+    stages, so this helper is intentionally conservative.
+    """
+
+    methods = getattr(
+        class_ir,
+        "methods",
+        None,
+    )
+
+    if methods is None:
+        return None
+
+    for method in methods:
+        if method.name == name:
+            return method
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Class construction
 # ---------------------------------------------------------------------------
@@ -206,32 +233,30 @@ def build_class(
     code: CodeType,
     *,
     bases: list[IRExpression] | None = None,
-    keywords: list[tuple[str, IRExpression]] | None = None,
     decorators: list[IRExpression] | None = None,
     body: list[IRStatement] | None = None,
 ) -> Class:
     """
     Build a Class IR node from a class-body code object.
 
-    Base classes, metaclass keywords and decorators are supplied by
-    the surrounding MAKE_FUNCTION / LOAD_BUILD_CLASS analysis.
+    Bases and decorators are supplied separately because they are
+    encoded in the surrounding bytecode rather than the class
+    CodeType itself.
     """
-
-    methods = discover_methods(
-        code
-    )
 
     return Class(
         offset=None,
         name=code.co_name,
-        bases=[] if bases is None else bases,
-        keywords=(
+        bases=(
             []
-            if keywords is None
-            else keywords
+            if bases is None
+            else bases
         ),
-        body=[] if body is None else body,
-        methods=methods,
+        body=(
+            []
+            if body is None
+            else body
+        ),
         decorators=(
             []
             if decorators is None
@@ -241,7 +266,7 @@ def build_class(
 
 
 # ---------------------------------------------------------------------------
-# Class metadata
+# Inspection
 # ---------------------------------------------------------------------------
 
 
@@ -251,68 +276,30 @@ def inspect_class(
     """
     Inspect a class-body code object.
 
-    This provides a convenient metadata representation for the
-    decompiler engine.
+    This does not attempt to reconstruct the complete class yet.
     """
 
-    class_ir = build_class(
+    if not is_class_code(code):
+        raise ClassError(
+            f"Code object {code.co_name!r} "
+            "does not look like a class body."
+        )
+
+    methods = discover_methods(
         code
     )
 
     return ClassMetadata(
-        name=class_ir.name,
-        bases=list(
-            class_ir.bases
-        ),
-        keywords=list(
-            class_ir.keywords
-        ),
-        decorators=list(
-            class_ir.decorators
-        ),
-        methods=list(
-            class_ir.methods
-        ),
-        body=list(
-            class_ir.body
-        ),
+        name=code.co_name,
+        bases=[],
+        decorators=[],
+        methods=methods,
+        body=[],
     )
 
 
 # ---------------------------------------------------------------------------
-# Method lookup
-# ---------------------------------------------------------------------------
-
-
-def find_method(
-    class_ir: Class,
-    name: str,
-) -> Function | None:
-    """Find a method by name."""
-
-    for method in class_ir.methods:
-        if method.name == name:
-            return method
-
-    return None
-
-
-def find_special_methods(
-    class_ir: Class,
-) -> list[Function]:
-    """Return all special methods defined by the class."""
-
-    return [
-        method
-        for method in class_ir.methods
-        if is_special_method(
-            method
-        )
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Class attributes
+# Attributes
 # ---------------------------------------------------------------------------
 
 
@@ -320,10 +307,10 @@ def class_attribute_names(
     code: CodeType,
 ) -> list[str]:
     """
-    Recover names referenced by a class body.
+    Return names referenced by the class body.
 
-    This is only a preliminary view. The engine will later distinguish
-    actual assignments from names merely loaded by the class body.
+    This is not yet an exact list of assignments. The engine will
+    distinguish LOAD_NAME / STORE_NAME operations later.
     """
 
     return sorted(
@@ -337,47 +324,42 @@ def class_attribute_names(
 
 
 # ---------------------------------------------------------------------------
-# Rendering helpers
+# Discovery
 # ---------------------------------------------------------------------------
 
 
-def render_class_signature(
-    class_ir: Class,
-) -> str:
-    """Render a class declaration."""
+def discover_classes(
+    code: CodeType,
+) -> list[Class]:
+    """
+    Discover class-like code objects directly contained in `code`.
 
-    bases = ", ".join(
-        _render_expression(base)
-        for base in class_ir.bases
-    )
+    Because CodeType does not explicitly identify class bodies, this
+    function uses conservative heuristics.
+    """
 
-    keywords = ", ".join(
-        f"{name}={_render_expression(value)}"
-        for name, value in class_ir.keywords
-    )
+    classes: list[Class] = []
 
-    arguments = ", ".join(
-        part
-        for part in (
-            bases,
-            keywords,
-        )
-        if part
-    )
+    for nested in nested_code_objects(code):
+        if not is_class_code(nested):
+            continue
 
-    if arguments:
-        return (
-            f"class {class_ir.name}"
-            f"({arguments})"
+        classes.append(
+            build_class(nested)
         )
 
-    return f"class {class_ir.name}"
+    return classes
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
 
 
 def _render_expression(
     expression: IRExpression,
 ) -> str:
-    """Render an IR expression for debugging."""
+    """Render an IR expression."""
 
     from .expressions import render_expression
 
@@ -386,49 +368,84 @@ def _render_expression(
     ).text
 
 
+def render_class_signature(
+    class_ir: Class,
+) -> str:
+    """Render the class declaration."""
+
+    bases = getattr(
+        class_ir,
+        "bases",
+        [],
+    )
+
+    if bases:
+        rendered_bases = ", ".join(
+            _render_expression(base)
+            for base in bases
+        )
+
+        return (
+            f"class {class_ir.name}"
+            f"({rendered_bases})"
+        )
+
+    return f"class {class_ir.name}"
+
+
 def render_class(
     class_ir: Class,
     *,
     indent: int = 0,
 ) -> str:
     """
-    Render a class using the current IR.
+    Render a class for debugging.
 
-    This is a temporary/debug renderer. The final source writer will
-    use Python's `ast` module.
+    Final Python generation will eventually use Python's AST module.
     """
 
     prefix = "    " * indent
 
-    signature = (
+    lines = [
         prefix
         + render_class_signature(
             class_ir
         )
         + ":"
+    ]
+
+    body = getattr(
+        class_ir,
+        "body",
+        [],
     )
 
-    lines = [signature]
-
-    if class_ir.body:
+    if body:
         from .statements import render_statements
 
-        body = render_statements(
-            class_ir.body,
-            indent=indent + 1,
-        )
-
-        lines.append(body)
-
-    for method in class_ir.methods:
-        from .functions import render_function
-
         lines.append(
-            render_function(
-                method,
+            render_statements(
+                body,
                 indent=indent + 1,
             )
         )
+
+    methods = getattr(
+        class_ir,
+        "methods",
+        [],
+    )
+
+    if methods:
+        from .functions import render_function
+
+        for method in methods:
+            lines.append(
+                render_function(
+                    method,
+                    indent=indent + 1,
+                )
+            )
 
     if len(lines) == 1:
         lines.append(
@@ -437,48 +454,3 @@ def render_class(
         )
 
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Class discovery
-# ---------------------------------------------------------------------------
-
-
-def discover_classes(
-    code: CodeType,
-) -> list[Class]:
-    """
-    Discover class-like code objects directly nested inside `code`.
-
-    Full class construction is completed later when the surrounding
-    bytecode reveals BUILD_CLASS arguments, bases and decorators.
-    """
-
-    classes: list[Class] = []
-
-    for nested in nested_code_objects(
-        code
-    ):
-        if not is_class_body(
-            nested
-        ):
-            continue
-
-        # A class body cannot be distinguished with certainty from
-        # an ordinary nested function using only the CodeType object.
-        # Avoid treating obvious functions as classes here.
-        if nested.co_argcount != 0:
-            continue
-
-        if nested.co_name.startswith(
-            "<"
-        ):
-            continue
-
-        classes.append(
-            build_class(
-                nested
-            )
-        )
-
-    return classes
