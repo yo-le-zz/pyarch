@@ -1,12 +1,20 @@
 from pathlib import Path
 
 import typer
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 
 from ._metadata import (
     __description__,
     __package_name__,
     __version__,
 )
+from .classifier import classify_extraction
 from .decompiler import decompile_tree
 from .extractor import (
     ExtractionError,
@@ -23,7 +31,20 @@ app = typer.Typer(
 )
 
 
-def version_callback(value: bool) -> None:
+def _progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn(
+            "[progress.description]{task.description}"
+        ),
+        BarColumn(),
+        TaskProgressColumn(),
+    )
+
+
+def version_callback(
+    value: bool,
+) -> None:
     if value:
         typer.echo(
             f"PyArch {__version__}"
@@ -57,17 +78,43 @@ def extract(
 ) -> None:
     """Extract a PyInstaller application."""
 
-    try:
-        bundle = extract_bundle(
-            path,
-            output,
+    with _progress() as progress:
+        task = progress.add_task(
+            "Extracting PyInstaller bundle",
+            total=2,
         )
-    except ExtractionError as error:
-        typer.echo(
-            f"Error: {error}",
-            err=True,
+
+        try:
+            bundle = extract_bundle(
+                path,
+                output,
+            )
+        except ExtractionError as error:
+            typer.echo(
+                f"Error: {error}",
+                err=True,
+            )
+            raise typer.Exit(
+                code=1
+            ) from error
+
+        progress.advance(task)
+
+        destination = (
+            output.resolve()
+            if output is not None
+            else (
+                Path(".pyarch")
+                / "dist"
+                / bundle.executable.name
+            )
         )
-        raise typer.Exit(code=1) from error
+
+        classification = classify_extraction(
+            destination
+        )
+
+        progress.advance(task)
 
     mode = (
         "onefile"
@@ -75,51 +122,93 @@ def extract(
         else "onedir"
     )
 
-    destination = (
-        output.resolve()
-        if output is not None
-        else (
-            Path(".pyarch")
-            / "dist"
-            / bundle.executable.name
-        )
-    )
-
     python_version = (
         f"{bundle.archive.python_version // 100}."
         f"{bundle.archive.python_version % 100}"
     )
 
-    typer.echo("✓ PyInstaller detected")
-    typer.echo(f"  Mode:       {mode}")
-    typer.echo(f"  Executable: {bundle.executable}")
-    typer.echo(f"  Python:     {python_version}")
-    typer.echo(f"  Output:     {destination}")
+    typer.echo()
+    typer.echo(
+        "✓ PyInstaller detected"
+    )
+    typer.echo(
+        f"  Mode:       {mode}"
+    )
+    typer.echo(
+        f"  Executable: {bundle.executable}"
+    )
+    typer.echo(
+        f"  Python:     {python_version}"
+    )
+    typer.echo(
+        f"  Output:     {destination}"
+    )
+    typer.echo()
+    typer.echo(
+        "  Recovery:"
+    )
+    typer.echo(
+        f"    Source:       {classification['source']}"
+    )
+    typer.echo(
+        f"    Application:  {classification['application']}"
+    )
+    typer.echo(
+        f"    Stdlib:       {classification['stdlib']}"
+    )
+    typer.echo(
+        f"    Runtime:      {classification['runtime']}"
+    )
 
 
 @app.command()
 def decompile(
     path: Path,
+    all_modules: bool = typer.Option(
+        False,
+        "--all",
+        help="Decompile every recovered Python module, including stdlib.",
+    ),
 ) -> None:
     """Analyze and disassemble recovered Python bytecode."""
 
     root = path.resolve()
 
-    pyc_root = (
-        root / "pyc"
-        if (root / "pyc").is_dir()
-        else root
+    if not (
+        root / "source"
+    ).is_dir():
+        try:
+            classify_extraction(root)
+        except Exception:
+            pass
+
+    output = (
+        root / "decompiled"
     )
 
-    output = root / "decompiled"
+    with _progress() as progress:
+        task = progress.add_task(
+            "Decompiling",
+            total=1,
+        )
 
-    count = decompile_tree(
-        pyc_root,
-        output,
-    )
+        count = decompile_tree(
+            root,
+            output,
+            all_modules=all_modules,
+            progress=progress,
+        )
+
+        progress.update(
+            task,
+            completed=1,
+        )
 
     typer.echo(
         f"✓ Processed {count} bytecode files"
+    )
+    typer.echo(
+        f"  Mode:   {'all modules' if all_modules else 'application'}"
     )
     typer.echo(
         f"  Output: {output}"
@@ -133,9 +222,21 @@ def reconstruct_command(
     path: Path,
 ) -> None:
     """Reconstruct a Python project."""
-    project = reconstruct(
-        path.resolve()
-    )
+
+    with _progress() as progress:
+        task = progress.add_task(
+            "Reconstructing project",
+            total=1,
+        )
+
+        project = reconstruct(
+            path.resolve()
+        )
+
+        progress.update(
+            task,
+            completed=1,
+        )
 
     typer.echo(
         f"✓ Project reconstructed: {project}"
@@ -148,9 +249,20 @@ def inspect(
 ) -> None:
     """Inspect recovered files and architecture."""
 
-    output = write_inspection(
-        path.resolve()
-    )
+    with _progress() as progress:
+        task = progress.add_task(
+            "Inspecting project",
+            total=1,
+        )
+
+        output = write_inspection(
+            path.resolve()
+        )
+
+        progress.update(
+            task,
+            completed=1,
+        )
 
     typer.echo(
         f"✓ Inspection written to {output}"
@@ -161,75 +273,89 @@ def inspect(
 def make(
     path: Path,
 ) -> None:
-    """Extract, analyze, reconstruct and inspect."""
+    """Extract, decompile, reconstruct and inspect."""
 
     source = path.resolve()
 
-    typer.echo(
-        "╭─ PyArch"
-    )
-    typer.echo(
-        "│ Extracting..."
-    )
-
-    try:
-        bundle = extract_bundle(
-            source,
-            None,
+    with _progress() as progress:
+        extract_task = progress.add_task(
+            "Extract",
+            total=1,
         )
-    except ExtractionError as error:
-        typer.echo(
-            f"│ Error: {error}",
-            err=True,
+
+        try:
+            bundle = extract_bundle(
+                source,
+                None,
+            )
+        except ExtractionError as error:
+            typer.echo(
+                f"Error: {error}",
+                err=True,
+            )
+            raise typer.Exit(
+                code=1
+            ) from error
+
+        root = (
+            Path(".pyarch")
+            / "dist"
+            / bundle.executable.name
         )
-        raise typer.Exit(
-            code=1
-        ) from error
 
-    root = (
-        Path(".pyarch")
-        / "dist"
-        / bundle.executable.name
-    )
+        classify_extraction(root)
 
+        progress.update(
+            extract_task,
+            completed=1,
+        )
+
+        decompile_task = progress.add_task(
+            "Decompile",
+            total=1,
+        )
+
+        decompile_tree(
+            root,
+            root / "decompiled",
+            progress=progress,
+        )
+
+        progress.update(
+            decompile_task,
+            completed=1,
+        )
+
+        reconstruct_task = progress.add_task(
+            "Reconstruct",
+            total=1,
+        )
+
+        reconstruct(root)
+
+        progress.update(
+            reconstruct_task,
+            completed=1,
+        )
+
+        inspect_task = progress.add_task(
+            "Inspect",
+            total=1,
+        )
+
+        write_inspection(root)
+
+        progress.update(
+            inspect_task,
+            completed=1,
+        )
+
+    typer.echo()
     typer.echo(
-        "│ ✓ Extraction complete"
-    )
-
-    typer.echo(
-        "│ Decompiling..."
-    )
-
-    decompile_tree(
-        root / "pyc",
-        root / "decompiled",
-    )
-
-    typer.echo(
-        "│ ✓ Bytecode analyzed"
-    )
-
-    typer.echo(
-        "│ Reconstructing..."
-    )
-
-    reconstruct(root)
-
-    typer.echo(
-        "│ ✓ Project reconstructed"
-    )
-
-    typer.echo(
-        "│ Inspecting..."
-    )
-
-    write_inspection(root)
-
-    typer.echo(
-        "│ ✓ Inspection complete"
+        "✓ PyArch pipeline complete"
     )
     typer.echo(
-        "╰─ Done."
+        f"  Output: {root}"
     )
 
 
