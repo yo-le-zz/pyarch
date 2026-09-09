@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .writer import write_and_validate
+
 """
 Main decompiler engine for PyArch.
 
@@ -177,6 +179,8 @@ class DecompileResult:
     diagnostics: DecompileDiagnostics
 
     code: DecompiledCode
+
+    source: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -728,10 +732,23 @@ class DecompilerEngine:
             comprehensions=comprehensions,
         )
 
+        source = ""
+
+        try:
+            source = write_and_validate(module)
+            diagnostics.recover(
+                f"Generated {len(source.splitlines())} source line(s)."
+            )
+        except Exception as error:
+            diagnostics.warn(
+                f"Could not generate Python source: {error}"
+            )
+
         return DecompileResult(
             module=module,
             diagnostics=diagnostics,
             code=result_code,
+            source=source,
         )
 
 
