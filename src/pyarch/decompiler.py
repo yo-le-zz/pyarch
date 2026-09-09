@@ -21,11 +21,18 @@ def decompile_file(
     path: Path,
     output: Path,
 ) -> None:
+    """
+    Decompile a single .pyc file.
+
+    Raises:
+        RuntimeError: If the bytecode cannot be decoded.
+    """
+
     try:
         pyc = load_pyc(path)
     except PYCError as error:
         raise RuntimeError(
-            str(error)
+            f"{path}: {error}"
         ) from error
 
     output.parent.mkdir(
@@ -45,7 +52,7 @@ def _default_inputs(
     """
     Return application-side bytecode.
 
-    source/ contains CArchive scripts.
+    source/ contains CArchive application scripts.
     application/ contains non-stdlib PYZ modules.
     """
 
@@ -70,9 +77,13 @@ def _default_inputs(
 def _all_inputs(
     root: Path,
 ) -> list[Path]:
-    pyc_root = (
-        root / "pyc"
-    )
+    """
+    Return every recovered .pyc file.
+
+    The original PYZ extraction is kept under pyc/.
+    """
+
+    pyc_root = root / "pyc"
 
     if not pyc_root.is_dir():
         return []
@@ -82,12 +93,30 @@ def _all_inputs(
     )
 
 
+def _relative_output_path(
+    path: Path,
+    root: Path,
+    all_modules: bool,
+) -> Path:
+    """Calculate the output path for a bytecode file."""
+
+    if all_modules:
+        base = root / "pyc"
+    elif path.is_relative_to(root / "source"):
+        base = root / "source"
+    else:
+        base = root / "application"
+
+    return path.relative_to(base)
+
+
 def decompile_tree(
     root: Path,
     output: Path,
     *,
     all_modules: bool = False,
     progress: Progress | None = None,
+    task_id: object | None = None,
 ) -> int:
     """
     Decompile recovered Python bytecode.
@@ -95,6 +124,10 @@ def decompile_tree(
     By default only application-side code is processed.
 
     --all processes every recovered PYZ module, including stdlib.
+
+    When a Rich Progress instance is supplied, the caller owns the
+    progress task. Otherwise this function creates its own progress
+    display.
     """
 
     root = root.resolve()
@@ -105,9 +138,6 @@ def decompile_tree(
         if all_modules
         else _default_inputs(root)
     )
-
-    if not inputs:
-        return 0
 
     own_progress = progress is None
 
@@ -122,31 +152,28 @@ def decompile_tree(
         )
         progress.start()
 
-    assert progress is not None
+        task_id = progress.add_task(
+            "Decompiling",
+            total=len(inputs),
+        )
 
-    task = progress.add_task(
-        "Decompiling",
-        total=len(inputs),
-    )
+    elif task_id is None:
+        task_id = progress.add_task(
+            "Decompiling",
+            total=len(inputs),
+        )
+
+    assert progress is not None
+    assert task_id is not None
 
     count = 0
 
     for path in inputs:
-        if all_modules:
-            relative = path.relative_to(
-                root / "pyc"
-            )
-        else:
-            if path.is_relative_to(
-                root / "source"
-            ):
-                relative = path.relative_to(
-                    root / "source"
-                )
-            else:
-                relative = path.relative_to(
-                    root / "application"
-                )
+        relative = _relative_output_path(
+            path,
+            root,
+            all_modules,
+        )
 
         target = (
             output
@@ -174,7 +201,9 @@ def decompile_tree(
 
         count += 1
 
-        progress.advance(task)
+        progress.advance(
+            task_id
+        )
 
     if own_progress:
         progress.stop()

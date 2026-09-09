@@ -167,7 +167,10 @@ def decompile(
     all_modules: bool = typer.Option(
         False,
         "--all",
-        help="Decompile every recovered Python module, including stdlib.",
+        help=(
+            "Decompile every recovered Python module, "
+            "including stdlib."
+        ),
     ),
 ) -> None:
     """Analyze and disassemble recovered Python bytecode."""
@@ -179,17 +182,18 @@ def decompile(
     ).is_dir():
         try:
             classify_extraction(root)
-        except Exception:
-            pass
+        except Exception as error:
+            typer.echo(
+                f"Warning: could not classify extraction: {error}",
+                err=True,
+            )
 
-    output = (
-        root / "decompiled"
-    )
+    output = root / "decompiled"
 
     with _progress() as progress:
         task = progress.add_task(
             "Decompiling",
-            total=1,
+            total=0,
         )
 
         count = decompile_tree(
@@ -197,18 +201,15 @@ def decompile(
             output,
             all_modules=all_modules,
             progress=progress,
-        )
-
-        progress.update(
-            task,
-            completed=1,
+            task_id=task,
         )
 
     typer.echo(
         f"✓ Processed {count} bytecode files"
     )
     typer.echo(
-        f"  Mode:   {'all modules' if all_modules else 'application'}"
+        "  Mode:   "
+        f"{'all modules' if all_modules else 'application'}"
     )
     typer.echo(
         f"  Output: {output}"
@@ -278,9 +279,13 @@ def make(
     source = path.resolve()
 
     with _progress() as progress:
+        # ---------------------------------------------------------
+        # Extract
+        # ---------------------------------------------------------
+
         extract_task = progress.add_task(
             "Extract",
-            total=1,
+            total=2,
         )
 
         try:
@@ -297,53 +302,70 @@ def make(
                 code=1
             ) from error
 
+        progress.advance(
+            extract_task
+        )
+
         root = (
             Path(".pyarch")
             / "dist"
             / bundle.executable.name
         )
 
-        classify_extraction(root)
-
-        progress.update(
-            extract_task,
-            completed=1,
+        classify_extraction(
+            root
         )
+
+        progress.advance(
+            extract_task
+        )
+
+        # ---------------------------------------------------------
+        # Decompile
+        # ---------------------------------------------------------
 
         decompile_task = progress.add_task(
             "Decompile",
-            total=1,
+            total=0,
         )
 
         decompile_tree(
             root,
             root / "decompiled",
             progress=progress,
+            task_id=decompile_task,
         )
 
-        progress.update(
-            decompile_task,
-            completed=1,
-        )
+        # ---------------------------------------------------------
+        # Reconstruct
+        # ---------------------------------------------------------
 
         reconstruct_task = progress.add_task(
             "Reconstruct",
             total=1,
         )
 
-        reconstruct(root)
+        reconstruct(
+            root
+        )
 
         progress.update(
             reconstruct_task,
             completed=1,
         )
 
+        # ---------------------------------------------------------
+        # Inspect
+        # ---------------------------------------------------------
+
         inspect_task = progress.add_task(
             "Inspect",
             total=1,
         )
 
-        write_inspection(root)
+        write_inspection(
+            root
+        )
 
         progress.update(
             inspect_task,
