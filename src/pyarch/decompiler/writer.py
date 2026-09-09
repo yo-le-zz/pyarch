@@ -3,28 +3,13 @@ from __future__ import annotations
 """
 Python AST writer for PyArch.
 
-The decompiler reconstructs an intermediate representation (IR).
-This module converts that IR into Python's standard ``ast`` tree.
-
-The final source code is generated with ``ast.unparse()``.
-
-Architecture:
-
-    PyArch IR
-       ↓
-    IR → Python AST
-       ↓
-    ast.fix_missing_locations()
-       ↓
-    ast.unparse()
-       ↓
-    .py
+Converts PyArch's intermediate representation into Python's standard
+AST and finally into valid Python source using ast.unparse().
 """
 
 import ast
 from typing import Iterable
 
-from .expressions import render_expression
 from .ir import (
     Assign,
     Attribute,
@@ -39,7 +24,6 @@ from .ir import (
     ExpressionStatement,
     Function,
     IRExpression,
-    IRNode,
     IRStatement,
     ListExpr,
     Module,
@@ -56,63 +40,12 @@ from .ir import (
 
 
 class WriterError(Exception):
-    """Raised when IR cannot be converted to Python AST."""
+    """Raised when the IR cannot be converted to Python AST."""
 
 
 # ---------------------------------------------------------------------------
-# Expression writer
+# Operators
 # ---------------------------------------------------------------------------
-
-
-def _constant_to_ast(
-    expression: Constant,
-) -> ast.expr:
-    """Convert an IR constant to an AST constant."""
-
-    return ast.Constant(
-        value=expression.value
-    )
-
-
-def _name_to_ast(
-    expression: Name,
-) -> ast.expr:
-    """Convert an IR name to an AST name."""
-
-    return ast.Name(
-        id=expression.name,
-        ctx=ast.Load(),
-    )
-
-
-def _attribute_to_ast(
-    expression: Attribute,
-) -> ast.expr:
-    """Convert an IR attribute access."""
-
-    return ast.Attribute(
-        value=expression_to_ast(
-            expression.value
-        ),
-        attr=expression.attribute,
-        ctx=ast.Load(),
-    )
-
-
-def _subscript_to_ast(
-    expression: Subscript,
-) -> ast.expr:
-    """Convert an IR subscript."""
-
-    return ast.Subscript(
-        value=expression_to_ast(
-            expression.value
-        ),
-        slice=expression_to_ast(
-            expression.slice
-        ),
-        ctx=ast.Load(),
-    )
 
 
 _BINARY_OPS: dict[str, type[ast.operator]] = {
@@ -154,19 +87,65 @@ _COMPARE_OPS: dict[str, type[ast.cmpop]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Expressions
+# ---------------------------------------------------------------------------
+
+
+def _constant_to_ast(
+    expression: Constant,
+) -> ast.expr:
+    return ast.Constant(
+        value=expression.value
+    )
+
+
+def _name_to_ast(
+    expression: Name,
+) -> ast.expr:
+    return ast.Name(
+        id=expression.name,
+        ctx=ast.Load(),
+    )
+
+
+def _attribute_to_ast(
+    expression: Attribute,
+) -> ast.expr:
+    return ast.Attribute(
+        value=expression_to_ast(
+            expression.value
+        ),
+        attr=expression.name,
+        ctx=ast.Load(),
+    )
+
+
+def _subscript_to_ast(
+    expression: Subscript,
+) -> ast.expr:
+    return ast.Subscript(
+        value=expression_to_ast(
+            expression.value
+        ),
+        slice=expression_to_ast(
+            expression.index
+        ),
+        ctx=ast.Load(),
+    )
+
+
 def _binary_to_ast(
     expression: BinaryOp,
 ) -> ast.expr:
-    """Convert a binary operation."""
-
     operator = _BINARY_OPS.get(
-        expression.operator
+        expression.op
     )
 
     if operator is None:
         raise WriterError(
             f"Unsupported binary operator: "
-            f"{expression.operator!r}"
+            f"{expression.op!r}"
         )
 
     return ast.BinOp(
@@ -183,16 +162,14 @@ def _binary_to_ast(
 def _unary_to_ast(
     expression: UnaryOp,
 ) -> ast.expr:
-    """Convert a unary operation."""
-
     operator = _UNARY_OPS.get(
-        expression.operator
+        expression.op
     )
 
     if operator is None:
         raise WriterError(
             f"Unsupported unary operator: "
-            f"{expression.operator!r}"
+            f"{expression.op!r}"
         )
 
     return ast.UnaryOp(
@@ -206,21 +183,14 @@ def _unary_to_ast(
 def _compare_to_ast(
     expression: Compare,
 ) -> ast.expr:
-    """Convert an IR comparison."""
+    operator = _COMPARE_OPS.get(
+        expression.op
+    )
 
-    operators = [
-        _COMPARE_OPS.get(
-            operator
-        )
-        for operator in expression.operators
-    ]
-
-    if any(
-        operator is None
-        for operator in operators
-    ):
+    if operator is None:
         raise WriterError(
-            "Unsupported comparison operator."
+            f"Unsupported comparison operator: "
+            f"{expression.op!r}"
         )
 
     return ast.Compare(
@@ -229,14 +199,11 @@ def _compare_to_ast(
         ),
         ops=[
             operator()
-            for operator in operators
-            if operator is not None
         ],
         comparators=[
             expression_to_ast(
-                value
+                expression.right
             )
-            for value in expression.comparators
         ],
     )
 
@@ -244,7 +211,17 @@ def _compare_to_ast(
 def _call_to_ast(
     expression: Call,
 ) -> ast.expr:
-    """Convert an IR function call."""
+    keywords: list[ast.keyword] = []
+
+    for name, value in expression.keywords:
+        keywords.append(
+            ast.keyword(
+                arg=name,
+                value=expression_to_ast(
+                    value
+                ),
+            )
+        )
 
     return ast.Call(
         func=expression_to_ast(
@@ -254,9 +231,9 @@ def _call_to_ast(
             expression_to_ast(
                 argument
             )
-            for argument in expression.arguments
+            for argument in expression.args
         ],
-        keywords=[],
+        keywords=keywords,
     )
 
 
@@ -304,19 +281,23 @@ def _set_to_ast(
 def _dict_to_ast(
     expression: DictExpr,
 ) -> ast.expr:
-    keys = [
-        expression_to_ast(
-            key
-        )
-        for key in expression.keys
-    ]
+    keys: list[ast.expr | None] = []
+    values: list[ast.expr] = []
 
-    values = [
-        expression_to_ast(
-            value
+    for key, value in expression.entries:
+        keys.append(
+            (
+                expression_to_ast(key)
+                if key is not None
+                else None
+            )
         )
-        for value in expression.values
-    ]
+
+        values.append(
+            expression_to_ast(
+                value
+            )
+        )
 
     return ast.Dict(
         keys=keys,
@@ -355,11 +336,7 @@ def _slice_to_ast(
 def expression_to_ast(
     expression: IRExpression,
 ) -> ast.expr:
-    """
-    Convert any supported IR expression to Python AST.
-
-    This is the central expression dispatcher.
-    """
+    """Convert an IR expression into Python AST."""
 
     if isinstance(
         expression,
@@ -472,66 +449,60 @@ def expression_to_ast(
 
 
 # ---------------------------------------------------------------------------
-# Target helpers
+# Assignment targets
 # ---------------------------------------------------------------------------
 
 
-def _target_to_ast(
-    expression: IRExpression,
+def _set_store_context(
+    node: ast.expr,
 ) -> ast.expr:
-    """
-    Convert an assignment target.
-
-    ``Name`` and ``Attribute``/``Subscript`` need Store context.
-    """
-
-    result = expression_to_ast(
-        expression
-    )
+    """Convert an expression node into an assignment target."""
 
     if isinstance(
-        result,
+        node,
         (
             ast.Name,
             ast.Attribute,
             ast.Subscript,
         ),
     ):
-        result.ctx = ast.Store()
+        node.ctx = ast.Store()
 
     elif isinstance(
-        result,
+        node,
         (
             ast.Tuple,
             ast.List,
         ),
     ):
-        result.ctx = ast.Store()
+        node.ctx = ast.Store()
 
-        for element in result.elts:
-            if isinstance(
-                element,
-                (
-                    ast.Name,
-                    ast.Attribute,
-                    ast.Subscript,
-                    ast.Tuple,
-                    ast.List,
-                ),
-            ):
-                element.ctx = ast.Store()
+        for element in node.elts:
+            _set_store_context(
+                element
+            )
 
-    return result
+    return node
+
+
+def target_to_ast(
+    expression: IRExpression,
+) -> ast.expr:
+    return _set_store_context(
+        expression_to_ast(
+            expression
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
-# Statement writer
+# Statements
 # ---------------------------------------------------------------------------
 
 
 def _expression_statement_to_ast(
     statement: ExpressionStatement,
-) -> ast.stmt:
+) -> ast.Expr:
     return ast.Expr(
         value=expression_to_ast(
             statement.expression
@@ -541,13 +512,12 @@ def _expression_statement_to_ast(
 
 def _assign_to_ast(
     statement: Assign,
-) -> ast.stmt:
+) -> ast.Assign:
     return ast.Assign(
         targets=[
-            _target_to_ast(
-                target
+            target_to_ast(
+                statement.target
             )
-            for target in statement.targets
         ],
         value=expression_to_ast(
             statement.value
@@ -557,30 +527,25 @@ def _assign_to_ast(
 
 def _delete_to_ast(
     statement: Delete,
-) -> ast.stmt:
+) -> ast.Delete:
     return ast.Delete(
         targets=[
-            _target_to_ast(
-                target
+            target_to_ast(
+                statement.target
             )
-            for target in statement.targets
         ]
     )
 
 
 def _return_to_ast(
     statement: Return,
-) -> ast.stmt:
-    value = getattr(
-        statement,
-        "value",
-        None,
-    )
-
+) -> ast.Return:
     return ast.Return(
         value=(
-            expression_to_ast(value)
-            if value is not None
+            expression_to_ast(
+                statement.value
+            )
+            if statement.value is not None
             else None
         )
     )
@@ -588,28 +553,20 @@ def _return_to_ast(
 
 def _raise_to_ast(
     statement: Raise,
-) -> ast.stmt:
-    value = getattr(
-        statement,
-        "exception",
-        None,
-    )
-
-    cause = getattr(
-        statement,
-        "cause",
-        None,
-    )
-
+) -> ast.Raise:
     return ast.Raise(
         exc=(
-            expression_to_ast(value)
-            if value is not None
+            expression_to_ast(
+                statement.exception
+            )
+            if statement.exception is not None
             else None
         ),
         cause=(
-            expression_to_ast(cause)
-            if cause is not None
+            expression_to_ast(
+                statement.cause
+            )
+            if statement.cause is not None
             else None
         ),
     )
@@ -618,7 +575,7 @@ def _raise_to_ast(
 def statement_to_ast(
     statement: IRStatement,
 ) -> ast.stmt:
-    """Convert one IR statement to Python AST."""
+    """Convert one IR statement into Python AST."""
 
     if isinstance(
         statement,
@@ -681,35 +638,22 @@ def statement_to_ast(
 def statements_to_ast(
     statements: Iterable[IRStatement],
 ) -> list[ast.stmt]:
-    """Convert multiple IR statements."""
-
-    result: list[ast.stmt] = []
-
-    for statement in statements:
-        result.append(
-            statement_to_ast(
-                statement
-            )
+    return [
+        statement_to_ast(
+            statement
         )
-
-    return result
+        for statement in statements
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Function writer
+# Functions
 # ---------------------------------------------------------------------------
 
 
 def _function_arguments(
     function: Function,
 ) -> ast.arguments:
-    """
-    Build a basic ``ast.arguments`` object.
-
-    Defaults and annotations will be recovered later from MAKE_FUNCTION
-    metadata.
-    """
-
     parameters = getattr(
         function,
         "parameters",
@@ -737,14 +681,8 @@ def _function_arguments(
 def function_to_ast(
     function: Function,
 ) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    """Convert a PyArch Function to Python AST."""
-
     body = statements_to_ast(
-        getattr(
-            function,
-            "body",
-            [],
-        )
+        function.body
     )
 
     if not body:
@@ -754,11 +692,7 @@ def function_to_ast(
 
     node_type = (
         ast.AsyncFunctionDef
-        if getattr(
-            function,
-            "is_async",
-            False,
-        )
+        if function.is_async
         else ast.FunctionDef
     )
 
@@ -768,83 +702,128 @@ def function_to_ast(
             function
         ),
         body=body,
-        decorator_list=[],
-        returns=None,
+        decorator_list=[
+            expression_to_ast(
+                decorator
+            )
+            for decorator in function.decorators
+        ],
+        returns=(
+            expression_to_ast(
+                function.returns
+            )
+            if function.returns is not None
+            else None
+        ),
         type_comment=None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Class writer
+# Classes
 # ---------------------------------------------------------------------------
 
 
 def class_to_ast(
     class_ir: Class,
 ) -> ast.ClassDef:
-    """Convert a PyArch Class to Python AST."""
+    body: list[ast.stmt] = []
 
-    body = statements_to_ast(
-        getattr(
-            class_ir,
-            "body",
-            [],
-        )
-    )
+    for item in class_ir.body:
+        if isinstance(
+            item,
+            Function,
+        ):
+            body.append(
+                function_to_ast(
+                    item
+                )
+            )
+        elif isinstance(
+            item,
+            IRStatement,
+        ):
+            body.append(
+                statement_to_ast(
+                    item
+                )
+            )
+        else:
+            raise WriterError(
+                f"Unsupported class body item: "
+                f"{type(item).__name__}"
+            )
 
     if not body:
         body = [
             ast.Pass()
         ]
 
-    bases = [
-        expression_to_ast(
-            base
-        )
-        for base in getattr(
-            class_ir,
-            "bases",
-            [],
-        )
-    ]
-
-    decorators = [
-        expression_to_ast(
-            decorator
-        )
-        for decorator in getattr(
-            class_ir,
-            "decorators",
-            [],
-        )
-    ]
-
     return ast.ClassDef(
         name=class_ir.name,
-        bases=bases,
+        bases=[
+            expression_to_ast(
+                base
+            )
+            for base in class_ir.bases
+        ],
         keywords=[],
         body=body,
-        decorator_list=decorators,
+        decorator_list=[
+            expression_to_ast(
+                decorator
+            )
+            for decorator in class_ir.decorators
+        ],
     )
 
 
 # ---------------------------------------------------------------------------
-# Module writer
+# Modules
 # ---------------------------------------------------------------------------
 
 
 def module_to_ast(
     module: Module,
 ) -> ast.Module:
-    """Convert a PyArch Module to Python AST."""
+    body: list[ast.stmt] = []
 
-    body = statements_to_ast(
-        getattr(
-            module,
-            "body",
-            [],
-        )
-    )
+    for item in module.body:
+        if isinstance(
+            item,
+            Function,
+        ):
+            body.append(
+                function_to_ast(
+                    item
+                )
+            )
+
+        elif isinstance(
+            item,
+            Class,
+        ):
+            body.append(
+                class_to_ast(
+                    item
+                )
+            )
+
+        elif isinstance(
+            item,
+            IRStatement,
+        ):
+            body.append(
+                statement_to_ast(
+                    item
+                )
+            )
+
+        else:
+            raise WriterError(
+                f"Unsupported module body item: "
+                f"{type(item).__name__}"
+            )
 
     return ast.Module(
         body=body,
@@ -852,11 +831,14 @@ def module_to_ast(
     )
 
 
+# ---------------------------------------------------------------------------
+# Source generation
+# ---------------------------------------------------------------------------
+
+
 def fix_locations(
     tree: ast.AST,
 ) -> ast.AST:
-    """Populate missing AST source locations."""
-
     return ast.fix_missing_locations(
         tree
     )
@@ -865,8 +847,6 @@ def fix_locations(
 def unparse(
     tree: ast.AST,
 ) -> str:
-    """Convert Python AST to source code."""
-
     return ast.unparse(
         tree
     )
@@ -875,9 +855,7 @@ def unparse(
 def write_module(
     module: Module,
 ) -> str:
-    """
-    Convert a PyArch module directly to Python source.
-    """
+    """Convert a PyArch Module into Python source."""
 
     tree = module_to_ast(
         module
@@ -892,21 +870,13 @@ def write_module(
     )
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-
 def validate_source(
     source: str,
 ) -> ast.Module:
-    """
-    Parse generated Python source to make sure it is syntactically
-    valid.
-    """
+    """Verify that generated source is valid Python."""
 
     try:
-        tree = ast.parse(
+        return ast.parse(
             source
         )
     except SyntaxError as error:
@@ -914,14 +884,10 @@ def validate_source(
             f"Generated invalid Python: {error}"
         ) from error
 
-    return tree
-
 
 def write_and_validate(
     module: Module,
 ) -> str:
-    """Generate Python source and validate it."""
-
     source = write_module(
         module
     )
@@ -936,6 +902,7 @@ def write_and_validate(
 __all__ = [
     "WriterError",
     "expression_to_ast",
+    "target_to_ast",
     "statement_to_ast",
     "statements_to_ast",
     "function_to_ast",
