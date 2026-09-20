@@ -57,10 +57,12 @@ def nested_code_objects(
 ) -> list[CodeType]:
     """Return code objects directly contained in a code object."""
 
+    from ..coderef import is_code_object
+
     result: list[CodeType] = []
 
     for constant in code.co_consts:
-        if isinstance(constant, CodeType):
+        if is_code_object(constant):
             result.append(constant)
 
     return result

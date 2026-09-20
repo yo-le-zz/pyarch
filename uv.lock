@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = ">=3.13"
 
+[manifest]
+members = [
+    "pyarch",
+    "pyarch-stress-test",
+]
+
 [[package]]
 name = "altgraph"
 version = "0.17.5"
@@ -102,6 +108,11 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pyinstaller" }]
+
+[[package]]
+name = "pyarch-stress-test"
+version = "1.0.0"
+source = { editable = "test" }
 
 [[package]]
 name = "pygments"

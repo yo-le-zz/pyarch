@@ -259,35 +259,29 @@ def normalize_binary_operator(
 # ---------------------------------------------------------------------------
 
 def _get_jump_target(
-    instruction: dis.Instruction,
+    instruction: object,
 ) -> int | None:
     """
     Return a normalized jump target.
 
-    CPython exposes jump targets through argval for modern Python
-    versions. Keeping this logic here means the rest of PyArch does
-    not need to care about CPython's representation.
+    Deliberately name-based rather than looking the opcode number up
+    in `dis.hasjabs`/`dis.hasjrel`: those tables describe *this*
+    interpreter's opcode numbering, which is meaningless for an
+    instruction that was disassembled by a different (remote)
+    interpreter for a different Python version. Every jump-carrying
+    opcode across 3.8-3.14 has "JUMP" in its name, or is one of the
+    two well-known exceptions below, so this stays correct without
+    needing per-version opcode tables.
     """
 
-    if instruction.opcode in dis.hasjabs:
-        if isinstance(instruction.argval, int):
-            return instruction.argval
-
-    if instruction.opcode in dis.hasjrel:
-        if isinstance(instruction.argval, int):
-            return instruction.argval
+    if not isinstance(instruction.argval, int):
+        return None
 
     if "JUMP" in instruction.opname:
-        if isinstance(instruction.argval, int):
-            return instruction.argval
+        return instruction.argval
 
-    if instruction.opname == "FOR_ITER":
-        if isinstance(instruction.argval, int):
-            return instruction.argval
-
-    if instruction.opname == "SEND":
-        if isinstance(instruction.argval, int):
-            return instruction.argval
+    if instruction.opname in ("FOR_ITER", "SEND"):
+        return instruction.argval
 
     return None
 
@@ -398,15 +392,26 @@ def translate_instructions(
 
 
 def translate_code(
-    code: CodeType,
+    code: CodeType | "RemoteCode",
 ) -> list[TInstruction]:
     """
     Translate a Python CodeType into normalized PyArch instructions.
+
+    A `RemoteCode` (see `pyarch.coderef`) carries instructions that
+    were already decoded by a matching interpreter for its own
+    Python version; those are used as-is instead of calling
+    `dis.get_instructions()`, which would use *this* interpreter's
+    opcode table.
     """
 
-    instructions = list(
-        dis.get_instructions(code)
-    )
+    from ..coderef import RemoteCode
+
+    if isinstance(code, RemoteCode):
+        instructions = code.pyarch_instructions
+    else:
+        instructions = list(
+            dis.get_instructions(code)
+        )
 
     return translate_instructions(
         instructions

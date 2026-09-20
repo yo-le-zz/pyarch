@@ -370,6 +370,79 @@ class VirtualStack:
     # Function calls
     # ------------------------------------------------------------------
 
+    def call_kw(
+        self,
+        argument_count: int,
+    ) -> None:
+        """
+        Reconstruct a call with keyword arguments (CALL_KW).
+
+        Stack (bottom to top): ... [NULL] function arg1 ... argN
+        kwnames_tuple -- the last `len(kwnames)` of the N arguments
+        are the keyword arguments, in the same order as kwnames.
+        """
+
+        if argument_count < 0:
+            raise StackError(
+                f"Invalid argument count: {argument_count}"
+            )
+
+        kwnames_expr = self.pop_expression()
+
+        if isinstance(kwnames_expr, Constant) and isinstance(
+            kwnames_expr.value, tuple
+        ):
+            kwnames = list(kwnames_expr.value)
+        else:
+            raise StackError(
+                "CALL_KW: expected a constant tuple of keyword "
+                "names."
+            )
+
+        if len(self) < argument_count + 1:
+            raise StackError(
+                "Not enough values on stack for CALL_KW."
+            )
+
+        arguments: list[IRExpression] = []
+
+        for _ in range(argument_count):
+            arguments.append(self.pop_expression())
+
+        arguments.reverse()
+
+        positional_count = argument_count - len(kwnames)
+
+        if positional_count < 0:
+            raise StackError(
+                "CALL_KW: more keyword names than arguments."
+            )
+
+        positional = arguments[:positional_count]
+        keyword_values = arguments[positional_count:]
+
+        keywords = list(zip(kwnames, keyword_values))
+
+        function = self.pop()
+
+        if function.kind == "null":
+            function = self.pop()
+        elif self._values and self._values[-1].kind == "null":
+            self.pop()
+
+        if function.expression is None:
+            raise StackError(
+                "CALL_KW target does not contain an expression."
+            )
+
+        self.push(
+            Call(
+                function=function.expression,
+                args=positional,
+                keywords=keywords,
+            )
+        )
+
     def call(
         self,
         argument_count: int,
@@ -407,10 +480,64 @@ class VirtualStack:
 
         arguments.reverse()
 
+        if (
+            argument_count == 0
+            and self._values
+            and self._values[-1].kind != "null"
+            and _looks_like_decoratable(
+                self._values[-1].expression
+            )
+            and len(self._values) >= 2
+            and self._values[-2].kind != "null"
+        ):
+            # CPython compiles decorator application
+            # (`@dec\ndef f(): ...` / `@dec\nclass C: ...`) as
+            # `[dec, value]` with CALL 0 and no NULL marker at all --
+            # unlike an ordinary zero-arg call, which always has a
+            # NULL immediately below the callable. Recognize the
+            # shape here rather than misreading `value` as a
+            # zero-arg call and losing `dec` as a dangling value.
+            value_slot = self.pop()
+            decorator_slot = self.pop()
+
+            if (
+                value_slot.expression is not None
+                and decorator_slot.expression is not None
+            ):
+                self.push(
+                    Call(
+                        function=decorator_slot.expression,
+                        args=[value_slot.expression],
+                        keywords=[],
+                    )
+                )
+                return
+
+            # Fall through with what we popped restored, in the
+            # unlikely case either slot wasn't a real expression.
+            self.push(
+                decorator_slot.expression,
+                kind=decorator_slot.kind,
+                data=decorator_slot.data,
+            )
+            self.push(
+                value_slot.expression,
+                kind=value_slot.kind,
+                data=value_slot.data,
+            )
+
         function = self.pop()
 
         if function.kind == "null":
+            # Older/alternative convention: NULL was popped where we
+            # expected the function; the real function is one slot
+            # further down.
             function = self.pop()
+        elif self._values and self._values[-1].kind == "null":
+            # Modern CPython convention: ... NULL function args... --
+            # the NULL marker sits just below the function and must
+            # be discarded too, or it corrupts later stack reads.
+            self.pop()
 
         if function.expression is None:
             raise StackError(
@@ -473,6 +600,133 @@ class VirtualStack:
         self.push(
             SetExpr(
                 elements=elements
+            )
+        )
+
+    def _literal_elements(
+        self,
+        expression: IRExpression,
+    ) -> list[IRExpression] | None:
+        """
+        Return the individual elements of an expression when they are
+        statically known (a literal container or constant tuple/list/
+        set), or None when the expression is opaque (e.g. an
+        arbitrary variable being unpacked with ``*``).
+        """
+
+        if isinstance(
+            expression,
+            (ListExpr, TupleExpr, SetExpr),
+        ):
+            return list(expression.elements)
+
+        if isinstance(
+            expression,
+            Constant,
+        ) and isinstance(
+            expression.value,
+            (tuple, list, set, frozenset),
+        ):
+            return [
+                Constant(value=item)
+                for item in expression.value
+            ]
+
+        return None
+
+    def extend_list(
+        self,
+    ) -> None:
+        """
+        LIST_EXTEND: extend a list in place with an iterable.
+
+        Used by CPython to build list literals such as ``[1, 2, 3]``
+        (``BUILD_LIST 0`` + a constant tuple + ``LIST_EXTEND``) and by
+        starred unpacking such as ``[a, *b, c]``.
+        """
+
+        source = self.pop_expression()
+        target = self.pop_expression()
+
+        if not isinstance(target, ListExpr):
+            raise StackError(
+                "LIST_EXTEND expected a list on the stack."
+            )
+
+        elements = self._literal_elements(source)
+
+        if elements is None:
+            raise StackError(
+                "LIST_EXTEND: cannot statically unpack a "
+                "non-literal iterable (unsupported starred "
+                "expression)."
+            )
+
+        self.push(
+            ListExpr(
+                elements=target.elements + elements
+            )
+        )
+
+    def update_set(
+        self,
+    ) -> None:
+        """SET_UPDATE: extend a set in place with an iterable."""
+
+        source = self.pop_expression()
+        target = self.pop_expression()
+
+        if not isinstance(target, SetExpr):
+            raise StackError(
+                "SET_UPDATE expected a set on the stack."
+            )
+
+        elements = self._literal_elements(source)
+
+        if elements is None:
+            raise StackError(
+                "SET_UPDATE: cannot statically unpack a "
+                "non-literal iterable (unsupported starred "
+                "expression)."
+            )
+
+        self.push(
+            SetExpr(
+                elements=target.elements + elements
+            )
+        )
+
+    def update_dict(
+        self,
+    ) -> None:
+        """DICT_UPDATE / DICT_MERGE: merge a mapping into a dict."""
+
+        source = self.pop_expression()
+        target = self.pop_expression()
+
+        if not isinstance(target, DictExpr):
+            raise StackError(
+                "DICT_UPDATE expected a dict on the stack."
+            )
+
+        if isinstance(source, DictExpr):
+            entries = list(source.entries)
+        elif isinstance(
+            source, Constant
+        ) and isinstance(source.value, dict):
+            entries = [
+                (Constant(value=key), Constant(value=value))
+                for key, value in source.value.items()
+            ]
+        else:
+            raise StackError(
+                "DICT_UPDATE: cannot statically unpack a "
+                "non-literal mapping (e.g. ``**other``)."
+            )
+
+        self.push(
+            DictExpr(
+                entries=target.entries + entries
             )
         )
 
@@ -668,6 +922,36 @@ _COMPARE_OPS = {
 }
 
 
+def _looks_like_decoratable(
+    expression: IRExpression | None,
+) -> bool:
+    """
+    True for the specific shapes that appear right after
+    MAKE_FUNCTION or a class body: something a decorator could be
+    wrapping. Deliberately narrow -- this is what distinguishes
+    CPython's optimized decorator-call shape (no NULL marker at all)
+    from an ordinary zero-argument call like ``obj.method()``, whose
+    result would otherwise be misread as a decorator target.
+    """
+
+    if expression is None:
+        return False
+
+    if hasattr(expression, "code"):
+        # Duck-typed check for statements.py's `_FunctionRef` without
+        # importing it here (that module imports this one).
+        return True
+
+    if (
+        isinstance(expression, Call)
+        and isinstance(expression.function, Name)
+        and expression.function.name == "__build_class__"
+    ):
+        return True
+
+    return False
+
+
 def apply_instruction(
     stack: VirtualStack,
     instruction: TInstruction,
@@ -703,7 +987,9 @@ def apply_instruction(
         "LOAD_NAME",
         "LOAD_GLOBAL",
         "LOAD_FAST",
+        "LOAD_FAST_CHECK",
         "LOAD_DEREF",
+        "LOAD_CLOSURE",
     }:
         if not isinstance(
             instruction.argval,
@@ -720,8 +1006,54 @@ def apply_instruction(
 
         return
 
+    if op == "LOAD_FAST_LOAD_FAST":
+        if not (
+            isinstance(instruction.argval, tuple)
+            and len(instruction.argval) == 2
+        ):
+            raise StackError(
+                "LOAD_FAST_LOAD_FAST has invalid names: "
+                f"{instruction.argval!r}"
+            )
+
+        first_name, second_name = instruction.argval
+        stack.push_name(first_name)
+        stack.push_name(second_name)
+        return
+
     if op == "PUSH_NULL":
         stack.push_null()
+        return
+
+    if op == "LOAD_SUPER_ATTR":
+        if not isinstance(
+            instruction.argval,
+            str,
+        ):
+            raise StackError(
+                "LOAD_SUPER_ATTR has invalid attribute name."
+            )
+
+        try:
+            stack.pop_expression()  # self (unused: super() is 0-arg)
+            stack.pop_expression()  # __class__ cell (unused)
+            stack.pop_expression()  # the `super` global itself
+        except StackError as error:
+            raise StackError(
+                f"LOAD_SUPER_ATTR: {error}"
+            ) from error
+
+        stack.push(
+            Attribute(
+                value=Call(
+                    function=Name(name="super"),
+                    args=[],
+                    keywords=[],
+                ),
+                name=instruction.argval,
+            )
+        )
+
         return
 
     if op == "LOAD_ATTR":
@@ -832,6 +1164,18 @@ def apply_instruction(
 
         return
 
+    if op == "CALL_KW":
+        if instruction.arg is None:
+            raise StackError(
+                "CALL_KW has no argument count."
+            )
+
+        stack.call_kw(
+            instruction.arg
+        )
+
+        return
+
     if op == "BUILD_LIST":
         stack.build_list(
             instruction.arg or 0
@@ -856,6 +1200,42 @@ def apply_instruction(
         )
         return
 
+    if op == "PYARCH_BOOLOP":
+        from .ir import BoolOp
+
+        kind, right_expr = instruction.argval
+        left_expr = stack.pop_expression()
+        stack.push(
+            BoolOp(op=kind, values=[left_expr, right_expr])
+        )
+        return
+
+    if op == "PYARCH_COMPREHENSION":
+        stack.push(instruction.argval)
+        return
+
+    if op == "TO_BOOL":
+        # Coerces TOS to bool for the upcoming conditional jump.
+        # Source reconstruction doesn't need to represent this
+        # explicitly -- Python evaluates truthiness the same way
+        # regardless -- so it's a no-op on the expression itself.
+        return
+
+    if op == "LIST_EXTEND":
+        stack.extend_list()
+        return
+
+    if op == "SET_UPDATE":
+        stack.update_set()
+        return
+
+    if op in {
+        "DICT_UPDATE",
+        "DICT_MERGE",
+    }:
+        stack.update_dict()
+        return
+
     if op == "BUILD_CONST_KEY_MAP":
         stack.build_const_key_map(
             instruction.arg or 0
@@ -876,6 +1256,42 @@ def apply_instruction(
         stack.pop()
         return
 
+    if op == "RETURN_GENERATOR":
+        # Marks the function as a generator; the value it pushes is
+        # immediately discarded by the POP_TOP CPython always emits
+        # right after it. No source-level representation needed.
+        return
+
+    if op == "YIELD_VALUE":
+        from .ir import Yield
+
+        value = stack.pop_expression()
+        stack.push(Yield(value=value))
+        return
+
+    if op == "CALL_INTRINSIC_1":
+        from .ir import ListExpr, TupleExpr
+
+        # INTRINSIC_LIST_TO_TUPLE (used when building the final
+        # positional-args tuple for a call with `*iterable`
+        # unpacking): fold the list literal into a tuple literal
+        # rather than modelling the conversion as a call.
+        if instruction.argval == "INTRINSIC_LIST_TO_TUPLE" or (
+            instruction.arg == 6
+        ):
+            value = stack.pop_expression()
+
+            if isinstance(value, ListExpr):
+                stack.push(TupleExpr(elements=value.elements))
+            else:
+                stack.push(value)
+
+            return
+
+        raise StackError(
+            f"Unsupported CALL_INTRINSIC_1: {instruction.argval!r}"
+        )
+
     if op == "COPY":
         if instruction.arg is None:
             raise StackError(
@@ -888,15 +1304,102 @@ def apply_instruction(
 
         return
 
+    if op == "CONVERT_VALUE":
+        from .ir import FormattedValue
+
+        conversion_map = {1: 115, 2: 114, 3: 97}
+        conversion = conversion_map.get(instruction.arg, -1)
+
+        value = stack.pop_expression()
+
+        stack.push(
+            FormattedValue(
+                value=value,
+                conversion=conversion,
+                format_spec=None,
+            )
+        )
+        return
+
+    if op == "FORMAT_SIMPLE":
+        from .ir import FormattedValue
+
+        value = stack.pop_expression()
+
+        if isinstance(value, FormattedValue):
+            stack.push(value)
+        else:
+            stack.push(
+                FormattedValue(
+                    value=value,
+                    conversion=-1,
+                    format_spec=None,
+                )
+            )
+        return
+
+    if op == "FORMAT_WITH_SPEC":
+        from .ir import FormattedValue
+
+        format_spec = stack.pop_expression()
+        value = stack.pop_expression()
+
+        if isinstance(value, FormattedValue):
+            value.format_spec = format_spec
+            stack.push(value)
+        else:
+            stack.push(
+                FormattedValue(
+                    value=value,
+                    conversion=-1,
+                    format_spec=format_spec,
+                )
+            )
+        return
+
+    if op == "BUILD_STRING":
+        from .ir import FormattedValue, JoinedStr
+
+        count = instruction.arg or 0
+        parts = [stack.pop_expression() for _ in range(count)]
+        parts.reverse()
+
+        # A JoinedStr with no FormattedValue parts is just adjacent
+        # string literal concatenation (e.g. implicit `"a" "b"` or
+        # plain str(...)-building code, not necessarily from an
+        # f-string) -- fold it into a single Constant when every part
+        # is a plain string constant, which is both simpler and more
+        # faithful to what the source likely was.
+        if all(
+            isinstance(part, Constant)
+            and isinstance(part.value, str)
+            for part in parts
+        ):
+            stack.push(
+                Constant(
+                    value="".join(part.value for part in parts)
+                )
+            )
+        else:
+            stack.push(JoinedStr(values=parts))
+        return
+
     if op == "SWAP":
         if instruction.arg is None:
             raise StackError(
                 "SWAP has no depth."
             )
 
-        stack.swap(
-            instruction.arg
-        )
+        if instruction.arg <= len(stack):
+            stack.swap(
+                instruction.arg
+            )
+        # else: this SWAP is protecting a real value across the
+        # exception-handling machinery (e.g. a `return` inside an
+        # `except` block, swapped past state this model doesn't
+        # track as a value). Harmless to skip: the value we do
+        # track keeps its position, which is all that matters for
+        # source reconstruction.
 
         return
 

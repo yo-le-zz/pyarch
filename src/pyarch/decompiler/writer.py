@@ -14,28 +14,47 @@ from .ir import (
     Assign,
     Attribute,
     BinaryOp,
+    BoolOp,
+    Break,
     Call,
     Class,
     Compare,
     Constant,
     Continue,
     Delete,
+    DictComp,
     DictExpr,
+    ExceptHandler,
     ExpressionStatement,
+    For,
+    FormattedValue,
     Function,
+    GeneratorExp,
+    If,
+    Import,
+    ImportFrom,
     IRExpression,
     IRStatement,
+    JoinedStr,
+    ListComp,
     ListExpr,
     Module,
     Name,
     Pass,
     Raise,
     Return,
+    SetComp,
     SetExpr,
     SliceExpr,
+    Starred,
     Subscript,
+    Try,
     TupleExpr,
     UnaryOp,
+    While,
+    With,
+    WithItem,
+    Yield,
 )
 
 
@@ -333,10 +352,104 @@ def _slice_to_ast(
     )
 
 
+def _comprehension_clauses(
+    generators: list,
+) -> list[ast.comprehension]:
+    return [
+        ast.comprehension(
+            target=target_to_ast(gen.target),
+            iter=expression_to_ast(gen.iter),
+            ifs=[expression_to_ast(cond) for cond in gen.ifs],
+            is_async=0,
+        )
+        for gen in generators
+    ]
+
+
 def expression_to_ast(
     expression: IRExpression,
 ) -> ast.expr:
     """Convert an IR expression into Python AST."""
+
+    if isinstance(expression, Yield):
+        return ast.Yield(
+            value=(
+                expression_to_ast(expression.value)
+                if expression.value is not None
+                else None
+            )
+        )
+
+    if isinstance(expression, BoolOp):
+        return ast.BoolOp(
+            op=ast.And() if expression.op == "and" else ast.Or(),
+            values=[
+                expression_to_ast(value)
+                for value in expression.values
+            ],
+        )
+
+    if isinstance(expression, JoinedStr):
+        return ast.JoinedStr(
+            values=[
+                expression_to_ast(part)
+                for part in expression.values
+            ]
+        )
+
+    if isinstance(expression, FormattedValue):
+        return ast.FormattedValue(
+            value=expression_to_ast(expression.value),
+            conversion=expression.conversion,
+            format_spec=(
+                ast.JoinedStr(
+                    values=[
+                        expression_to_ast(expression.format_spec)
+                    ]
+                )
+                if expression.format_spec is not None
+                else None
+            ),
+        )
+
+    if isinstance(expression, ListComp):
+        return ast.ListComp(
+            elt=expression_to_ast(expression.element),
+            generators=_comprehension_clauses(
+                expression.generators
+            ),
+        )
+
+    if isinstance(expression, SetComp):
+        return ast.SetComp(
+            elt=expression_to_ast(expression.element),
+            generators=_comprehension_clauses(
+                expression.generators
+            ),
+        )
+
+    if isinstance(expression, DictComp):
+        return ast.DictComp(
+            key=expression_to_ast(expression.key),
+            value=expression_to_ast(expression.value),
+            generators=_comprehension_clauses(
+                expression.generators
+            ),
+        )
+
+    if isinstance(expression, GeneratorExp):
+        return ast.GeneratorExp(
+            elt=expression_to_ast(expression.element),
+            generators=_comprehension_clauses(
+                expression.generators
+            ),
+        )
+
+    if isinstance(expression, Starred):
+        return ast.Starred(
+            value=expression_to_ast(expression.value),
+            ctx=ast.Load(),
+        )
 
     if isinstance(
         expression,
@@ -481,6 +594,10 @@ def _set_store_context(
             _set_store_context(
                 element
             )
+
+    elif isinstance(node, ast.Starred):
+        node.ctx = ast.Store()
+        _set_store_context(node.value)
 
     return node
 
@@ -629,6 +746,117 @@ def statement_to_ast(
     ):
         return ast.Continue()
 
+    if isinstance(
+        statement,
+        Break,
+    ):
+        return ast.Break()
+
+    if isinstance(
+        statement,
+        If,
+    ):
+        return ast.If(
+            test=expression_to_ast(statement.test),
+            body=body_to_ast(statement.body),
+            orelse=body_to_ast(
+                statement.orelse, allow_empty=True
+            ),
+        )
+
+    if isinstance(
+        statement,
+        While,
+    ):
+        return ast.While(
+            test=expression_to_ast(statement.test),
+            body=body_to_ast(statement.body),
+            orelse=[],
+        )
+
+    if isinstance(
+        statement,
+        For,
+    ):
+        return ast.For(
+            target=target_to_ast(statement.target),
+            iter=expression_to_ast(statement.iter),
+            body=body_to_ast(statement.body),
+            orelse=[],
+        )
+
+    if isinstance(
+        statement,
+        Import,
+    ):
+        return ast.Import(
+            names=[
+                ast.alias(name=module, asname=asname)
+                for module, asname in statement.names
+            ]
+        )
+
+    if isinstance(
+        statement,
+        ImportFrom,
+    ):
+        return ast.ImportFrom(
+            module=statement.module or None,
+            names=[
+                ast.alias(name=name, asname=asname)
+                for name, asname in statement.names
+            ],
+            level=statement.level,
+        )
+
+    if isinstance(
+        statement,
+        Try,
+    ):
+        return ast.Try(
+            body=body_to_ast(statement.body),
+            handlers=[
+                ast.ExceptHandler(
+                    type=(
+                        expression_to_ast(handler.type)
+                        if handler.type is not None
+                        else None
+                    ),
+                    name=handler.name,
+                    body=body_to_ast(handler.body),
+                )
+                for handler in statement.handlers
+            ],
+            orelse=body_to_ast(
+                statement.orelse, allow_empty=True
+            ),
+            finalbody=body_to_ast(
+                statement.finalbody, allow_empty=True
+            ),
+        )
+
+    if isinstance(statement, With):
+        node_type = (
+            ast.AsyncWith if statement.is_async else ast.With
+        )
+
+        return node_type(
+            items=[
+                ast.withitem(
+                    context_expr=expression_to_ast(
+                        item.context_expr
+                    ),
+                    optional_vars=(
+                        target_to_ast(item.optional_vars)
+                        if item.optional_vars is not None
+                        else None
+                    ),
+                )
+                for item in statement.items
+            ],
+            body=body_to_ast(statement.body),
+        )
+
     raise WriterError(
         f"Unsupported IR statement: "
         f"{type(statement).__name__}"
@@ -646,6 +874,42 @@ def statements_to_ast(
     ]
 
 
+def body_to_ast(
+    items: Iterable[object],
+    *,
+    allow_empty: bool = False,
+) -> list[ast.stmt]:
+    """
+    Convert any body list (module/class/function/if/while/for) to
+    AST statements, allowing nested Function/Class definitions to
+    appear inline wherever ordinary statements can.
+
+    `allow_empty` should be True only for an `if` statement's
+    `orelse`, where an empty list is valid Python (no else clause) --
+    every other body (function/class/while/for/if-body) must contain
+    at least one statement.
+    """
+
+    result: list[ast.stmt] = []
+
+    for item in items:
+        if isinstance(item, Function):
+            result.append(function_to_ast(item))
+        elif isinstance(item, Class):
+            result.append(class_to_ast(item))
+        elif isinstance(item, IRStatement):
+            result.append(statement_to_ast(item))
+        else:
+            raise WriterError(
+                f"Unsupported body item: {type(item).__name__}"
+            )
+
+    if not result and not allow_empty:
+        result = [ast.Pass()]
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
@@ -660,35 +924,90 @@ def _function_arguments(
         [],
     )
 
-    args = [
-        ast.arg(
-            arg=name
+    defaults_by_name = getattr(
+        function,
+        "defaults",
+        None,
+    ) or {}
+
+    annotations_by_name = getattr(
+        function,
+        "annotations",
+        None,
+    ) or {}
+
+    def _make_arg(name: str) -> ast.arg:
+        annotation = annotations_by_name.get(name)
+        return ast.arg(
+            arg=name,
+            annotation=(
+                expression_to_ast(annotation)
+                if annotation is not None
+                else None
+            ),
         )
-        for name in parameters
+
+    args: list[ast.arg] = []
+    kwonlyargs: list[ast.arg] = []
+    vararg: ast.arg | None = None
+    kwarg: ast.arg | None = None
+    seen_star = False
+
+    for name in parameters:
+        if name == "*":
+            seen_star = True
+        elif name.startswith("**"):
+            kwarg = _make_arg(name[2:])
+        elif name.startswith("*"):
+            vararg = _make_arg(name[1:])
+            seen_star = True
+        elif seen_star:
+            kwonlyargs.append(_make_arg(name))
+        else:
+            args.append(_make_arg(name))
+
+    # Positional defaults are right-aligned: a default for the Nth
+    # positional arg from the end applies to `args[-N]`. Only a
+    # trailing run (in original order) can have defaults in valid
+    # Python; if defaults exist for some but not a trailing run,
+    # that reflects a shape PyArch couldn't fully recover -- keep
+    # only the trailing matched ones rather than emit invalid syntax.
+    trailing_defaults: list[ast.expr] = []
+
+    for arg in reversed(args):
+        if arg.arg in defaults_by_name:
+            trailing_defaults.insert(
+                0, expression_to_ast(defaults_by_name[arg.arg])
+            )
+        else:
+            break
+
+    kw_defaults = [
+        (
+            expression_to_ast(defaults_by_name[arg.arg])
+            if arg.arg in defaults_by_name
+            else None
+        )
+        for arg in kwonlyargs
     ]
 
     return ast.arguments(
         posonlyargs=[],
         args=args,
-        vararg=None,
-        kwonlyargs=[],
-        kw_defaults=[],
-        kwarg=None,
-        defaults=[],
+        vararg=vararg,
+        kwonlyargs=kwonlyargs,
+        kw_defaults=kw_defaults,
+        kwarg=kwarg,
+        defaults=trailing_defaults,
     )
 
 
 def function_to_ast(
     function: Function,
 ) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    body = statements_to_ast(
+    body = body_to_ast(
         function.body
     )
-
-    if not body:
-        body = [
-            ast.Pass()
-        ]
 
     node_type = (
         ast.AsyncFunctionDef
@@ -727,37 +1046,7 @@ def function_to_ast(
 def class_to_ast(
     class_ir: Class,
 ) -> ast.ClassDef:
-    body: list[ast.stmt] = []
-
-    for item in class_ir.body:
-        if isinstance(
-            item,
-            Function,
-        ):
-            body.append(
-                function_to_ast(
-                    item
-                )
-            )
-        elif isinstance(
-            item,
-            IRStatement,
-        ):
-            body.append(
-                statement_to_ast(
-                    item
-                )
-            )
-        else:
-            raise WriterError(
-                f"Unsupported class body item: "
-                f"{type(item).__name__}"
-            )
-
-    if not body:
-        body = [
-            ast.Pass()
-        ]
+    body = body_to_ast(class_ir.body)
 
     return ast.ClassDef(
         name=class_ir.name,
@@ -786,44 +1075,7 @@ def class_to_ast(
 def module_to_ast(
     module: Module,
 ) -> ast.Module:
-    body: list[ast.stmt] = []
-
-    for item in module.body:
-        if isinstance(
-            item,
-            Function,
-        ):
-            body.append(
-                function_to_ast(
-                    item
-                )
-            )
-
-        elif isinstance(
-            item,
-            Class,
-        ):
-            body.append(
-                class_to_ast(
-                    item
-                )
-            )
-
-        elif isinstance(
-            item,
-            IRStatement,
-        ):
-            body.append(
-                statement_to_ast(
-                    item
-                )
-            )
-
-        else:
-            raise WriterError(
-                f"Unsupported module body item: "
-                f"{type(item).__name__}"
-            )
+    body = body_to_ast(module.body)
 
     return ast.Module(
         body=body,

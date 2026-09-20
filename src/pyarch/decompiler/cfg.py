@@ -40,6 +40,11 @@ _CONDITIONAL_JUMPS = frozenset(
         "POP_JUMP_BACKWARD_IF_TRUE",
         "JUMP_IF_FALSE_OR_POP",
         "JUMP_IF_TRUE_OR_POP",
+        # FOR_ITER either falls through into the loop body (next value
+        # available) or jumps to its target once the iterator is
+        # exhausted. Treating it like a conditional jump ensures both
+        # edges are kept in the CFG.
+        "FOR_ITER",
     }
 )
 

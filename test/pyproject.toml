@@ -1,0 +1,14 @@
+[project]
+name = "pyarch-stress-test"
+version = "1.0.0"
+description = "Complex Python project used to stress-test PyArch bytecode reconstruction and decompilation"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+pyarch-stress-test = "pyarch_stress_test:run_demo"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"

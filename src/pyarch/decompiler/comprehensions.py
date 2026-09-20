@@ -199,24 +199,23 @@ def _get_instructions(
     code: CodeType,
 ):
     """
-    Return CPython's decoded instructions.
-
-    Keeping this isolated makes it easier to replace this with
-    PyArch's normalized TInstruction stream later.
+    Return decoded instructions for `code`, using PyArch's own
+    version-aware translation (which already knows how to read a
+    `RemoteCode` from another Python version) instead of calling
+    `dis` directly, which only understands this interpreter's own
+    bytecode.
     """
 
-    import dis
+    from .translate import translate_code
 
-    return list(
-        dis.get_instructions(code)
-    )
+    return translate_code(code)
 
 
 def _instruction_names(
     code: CodeType,
 ) -> list[str]:
     return [
-        instruction.opname
+        instruction.op
         for instruction in _get_instructions(code)
     ]
 
@@ -401,7 +400,7 @@ def detect_inline_comprehension(
     )
 
     names = [
-        instruction.opname
+        instruction.op
         for instruction in instructions
     ]
 
