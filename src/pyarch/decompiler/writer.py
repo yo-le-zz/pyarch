@@ -11,6 +11,7 @@ import ast
 from typing import Iterable
 
 from .ir import (
+    AnnAssign,
     Assign,
     Attribute,
     BinaryOp,
@@ -708,6 +709,19 @@ def statement_to_ast(
     ):
         return _assign_to_ast(
             statement
+        )
+
+    if isinstance(statement, AnnAssign):
+        target = target_to_ast(statement.target)
+        return ast.AnnAssign(
+            target=target,
+            annotation=expression_to_ast(statement.annotation),
+            value=(
+                expression_to_ast(statement.value)
+                if statement.value is not None
+                else None
+            ),
+            simple=1 if isinstance(target, ast.Name) else 0,
         )
 
     if isinstance(

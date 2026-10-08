@@ -29,6 +29,7 @@ from .ir import (
     IRStatement,
     Name,
     Pass,
+    Raise,
     Return,
     Starred,
     TupleExpr,
@@ -221,6 +222,8 @@ def process_instruction(
         "LOAD_FAST_AND_CLEAR",
         "PUSH_EXC_INFO",
         "POP_EXCEPT",
+        "SETUP_ANNOTATIONS",
+        "RETURN_GENERATOR",
     }:
         return None
 
@@ -510,6 +513,7 @@ def process_instruction(
         "BUILD_MAP",
         "BUILD_CONST_KEY_MAP",
         "BUILD_SLICE",
+        "BINARY_SLICE",
         "BINARY_SUBSCR",
         "COPY",
         "SWAP",
@@ -866,7 +870,6 @@ def process_instruction(
     # ------------------------------------------------------------------
 
     if op in {
-        "RAISE_VARARGS",
         "RERAISE",
         "PUSH_EXC_INFO",
         "POP_EXCEPT",
@@ -874,6 +877,37 @@ def process_instruction(
         "WITH_EXCEPT_START",
     }:
         return None
+
+    if op == "RAISE_VARARGS":
+        argcount = instruction.arg or 0
+
+        if argcount == 0:
+            return Raise(exception=None, cause=None)
+
+        if argcount == 1:
+            try:
+                exc = _pop_expression(stack)
+            except StackError as error:
+                raise StatementError(
+                    f"Could not process RAISE_VARARGS: {error}"
+                ) from error
+
+            return Raise(exception=exc, cause=None)
+
+        if argcount == 2:
+            try:
+                cause = _pop_expression(stack)
+                exc = _pop_expression(stack)
+            except StackError as error:
+                raise StatementError(
+                    f"Could not process RAISE_VARARGS: {error}"
+                ) from error
+
+            return Raise(exception=exc, cause=cause)
+
+        raise StatementError(
+            f"Unsupported RAISE_VARARGS argument count: {argcount}"
+        )
 
     # ------------------------------------------------------------------
     # Unsupported instruction

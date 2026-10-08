@@ -818,6 +818,20 @@ class VirtualStack:
     # Slice
     # ------------------------------------------------------------------
 
+    def binary_slice(self) -> None:
+        """Apply container[start:stop] (Python 3.12+ fused opcode)."""
+
+        upper = self.pop_expression()
+        lower = self.pop_expression()
+        value = self.pop_expression()
+
+        self.push(
+            Subscript(
+                value=value,
+                index=SliceExpr(lower=lower, upper=upper),
+            )
+        )
+
     def build_slice(
         self,
         count: int,
@@ -1112,7 +1126,19 @@ def apply_instruction(
         return
 
     if op == "COMPARE_OP":
-        operator = instruction.argrepr
+        operator = instruction.argval
+
+        if not isinstance(operator, str) or (
+            operator not in _COMPARE_OPS
+        ):
+            operator = instruction.argrepr
+
+            if (
+                isinstance(operator, str)
+                and operator.startswith("bool(")
+                and operator.endswith(")")
+            ):
+                operator = operator[5:-1]
 
         if operator not in _COMPARE_OPS:
             raise StackError(
@@ -1240,6 +1266,10 @@ def apply_instruction(
         stack.build_const_key_map(
             instruction.arg or 0
         )
+        return
+
+    if op == "BINARY_SLICE":
+        stack.binary_slice()
         return
 
     if op == "BUILD_SLICE":

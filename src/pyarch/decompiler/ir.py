@@ -241,6 +241,15 @@ class Assign(IRStatement):
 
 
 @dataclass(slots=True)
+class AnnAssign(IRStatement):
+    """An annotated assignment: `x: int` or `x: int = 5`."""
+
+    target: IRExpression = field(default_factory=IRExpression)
+    annotation: IRExpression = field(default_factory=IRExpression)
+    value: IRExpression | None = None
+
+
+@dataclass(slots=True)
 class Delete(IRStatement):
     """A deletion such as del x or del obj.attr."""
 

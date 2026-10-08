@@ -208,6 +208,7 @@ def _region(
     code_map: dict[int, "Function | Class"] | None,
     diagnostics,
     loop_stack: list[tuple[int, int | None]],
+    skip_while_header: int | None = None,
 ) -> tuple[list[IRStatement], int | None]:
     """
     Reconstruct statements for blocks from `start` up to (excluding)
@@ -460,8 +461,10 @@ def _region(
             cfg, current
         )
 
-        if back_edge_source is not None and _is_conditional(
-            last
+        if (
+            back_edge_source is not None
+            and current != skip_while_header
+            and _is_conditional(last)
         ):
             stmt, resume = _structure_while(
                 cfg,
@@ -487,6 +490,7 @@ def _region(
                 code_map,
                 diagnostics,
                 loop_stack,
+                outer_stop=stop,
             )
             statements.extend(new_statements)
             current = resume
@@ -621,6 +625,7 @@ def _structure_if(
     code_map,
     diagnostics,
     loop_stack,
+    outer_stop: int | None = None,
 ) -> tuple[list[IRStatement], int | None]:
     instrs = instr_by_block[header]
     condition_instr = instrs[-1]
@@ -648,7 +653,7 @@ def _structure_if(
         cfg,
         instr_by_block,
         true_id,
-        false_id,
+        false_id if false_id is not None else outer_stop,
         code_map,
         diagnostics,
         loop_stack,
@@ -695,7 +700,7 @@ def _structure_if(
         cfg,
         instr_by_block,
         false_id,
-        then_end,
+        then_end if then_end is not None else outer_stop,
         code_map,
         diagnostics,
         loop_stack,
@@ -718,6 +723,14 @@ def _structure_if(
 # ---------------------------------------------------------------------------
 
 
+def _in_range(
+    value: int | None,
+    low: int,
+    high: int,
+) -> bool:
+    return value is not None and low <= value <= high
+
+
 def _structure_while(
     cfg: ControlFlowGraph,
     instr_by_block: dict[int, list[TInstruction]],
@@ -728,6 +741,103 @@ def _structure_while(
 ) -> tuple[IRStatement, int | None]:
     instrs = instr_by_block[header]
     condition_instr = instrs[-1]
+
+    back_edge_source = _find_back_edge_source(cfg, header)
+
+    # Often the block that jumps back is nothing but a bare
+    # JUMP_BACKWARD trampoline: the real re-evaluated loop test sits
+    # in its (unique) predecessor, whose fallthrough leads into the
+    # trampoline. Look one step back in that case.
+    tail_block = back_edge_source
+
+    if tail_block is not None:
+        trampoline_instrs = instr_by_block.get(tail_block, [])
+
+        if (
+            len(trampoline_instrs) == 1
+            and trampoline_instrs[0].op in _UNCONDITIONAL_OPS
+        ):
+            trampoline = get_block(cfg, tail_block)
+            preds = (
+                [p for p in trampoline.predecessors if p != tail_block]
+                if trampoline is not None
+                else []
+            )
+
+            if len(preds) == 1:
+                tail_block = preds[0]
+
+    tail_instrs = (
+        instr_by_block.get(tail_block, [])
+        if tail_block is not None
+        else []
+    )
+    tail_last = tail_instrs[-1] if tail_instrs else None
+
+    use_tail_test = False
+
+    if (
+        back_edge_source is not None
+        and tail_block is not None
+        and tail_block != header
+        and tail_last is not None
+        and _is_conditional(tail_last)
+    ):
+        # The header's own conditional might just be an ordinary
+        # `if` inside the loop body (not the loop's controlling
+        # test) if CPython pushed the real, re-evaluated condition
+        # down to the back-edge block instead of fusing it with the
+        # header (this happens whenever the body itself branches,
+        # e.g. an `if` right at the top of a `while`). Recognize
+        # that by checking whether the header's own branches both
+        # stay *inside* the loop region -- a genuine while-test
+        # always has an exit branch leading outside it.
+        true_id, false_id = _true_false_targets(
+            cfg, header, condition_instr
+        )
+
+        if _in_range(
+            true_id, header, tail_block
+        ) and _in_range(false_id, header, tail_block):
+            use_tail_test = True
+
+    if use_tail_test:
+        pre_statements = _reconstruct(
+            tail_instrs[:-1], code_map, diagnostics
+        )
+
+        stack_result = _reconstruct_with_stack(
+            tail_instrs[:-1], code_map
+        )
+
+        try:
+            condition = stack_result.stack.pop_expression()
+        except Exception as error:
+            raise ControlFlowStructureError(
+                f"Could not evaluate while-condition: {error}"
+            ) from error
+
+        _loop_id, exit_id = _true_false_targets(
+            cfg, tail_block, tail_last
+        )
+
+        body_statements, _end = _region(
+            cfg,
+            instr_by_block,
+            header,
+            tail_block,
+            code_map,
+            diagnostics,
+            loop_stack + [(header, exit_id)],
+            skip_while_header=header,
+        )
+
+        node = While(
+            test=condition,
+            body=(body_statements + pre_statements) or [Pass()],
+        )
+
+        return node, exit_id
 
     pre_statements = _reconstruct(
         instrs[:-1], code_map, diagnostics

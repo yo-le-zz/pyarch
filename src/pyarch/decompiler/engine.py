@@ -710,6 +710,110 @@ def _remove_module_return(
     return statements
 
 
+def _recover_annotations(
+    statements: list[IRStatement],
+) -> list[IRStatement]:
+    """
+    CPython compiles a bare ``x: int`` (module/class scope) into
+    ``__annotations__['x'] = int``, and ``x: int = 5`` into the plain
+    assignment ``x = 5`` immediately followed by that same
+    ``__annotations__`` entry. Recover the idiomatic ``AnnAssign``
+    form: merge with the preceding assignment when there is one for
+    the same name, otherwise emit a value-less annotation.
+    """
+
+    from .ir import (
+        AnnAssign,
+        Assign,
+        Class,
+        Constant,
+        For,
+        If,
+        Name,
+        Subscript,
+        Try,
+        While,
+    )
+
+    def is_annotation_entry(
+        statement: IRStatement,
+    ) -> tuple[str, IRExpression] | None:
+        if not isinstance(statement, Assign):
+            return None
+
+        target = statement.target
+
+        if (
+            isinstance(target, Subscript)
+            and isinstance(target.value, Name)
+            and target.value.name == "__annotations__"
+            and isinstance(target.index, Constant)
+            and isinstance(target.index.value, str)
+        ):
+            return target.index.value, statement.value
+
+        return None
+
+    result: list[IRStatement] = []
+
+    for statement in statements:
+        if isinstance(statement, If):
+            statement.body = _recover_annotations(statement.body)
+            statement.orelse = _recover_annotations(
+                statement.orelse
+            )
+        elif isinstance(statement, (While, For)):
+            statement.body = _recover_annotations(statement.body)
+        elif isinstance(statement, Try):
+            statement.body = _recover_annotations(statement.body)
+            for handler in statement.handlers:
+                handler.body = _recover_annotations(handler.body)
+            statement.orelse = _recover_annotations(
+                statement.orelse
+            )
+            statement.finalbody = _recover_annotations(
+                statement.finalbody
+            )
+        elif isinstance(statement, Class):
+            statement.body = _recover_annotations(statement.body)
+        elif isinstance(statement, Function):
+            statement.body = _recover_annotations(statement.body)
+
+        entry = is_annotation_entry(statement)
+
+        if entry is not None:
+            name, annotation = entry
+
+            if (
+                result
+                and isinstance(result[-1], Assign)
+                and isinstance(result[-1].target, Name)
+                and result[-1].target.name == name
+            ):
+                previous = result.pop()
+                result.append(
+                    AnnAssign(
+                        target=Name(name=name),
+                        annotation=annotation,
+                        value=previous.value,
+                    )
+                )
+            else:
+                result.append(
+                    AnnAssign(
+                        target=Name(name=name),
+                        annotation=annotation,
+                        value=None,
+                    )
+                )
+
+            continue
+
+        result.append(statement)
+
+    return result
+
+
 def _merge_consecutive_imports(
     statements: list[IRStatement],
 ) -> list[IRStatement]:
@@ -1059,6 +1163,10 @@ class DecompilerEngine:
         )
 
         statements = _merge_consecutive_imports(
+            statements
+        )
+
+        statements = _recover_annotations(
             statements
         )
 
